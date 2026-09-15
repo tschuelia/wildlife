@@ -1,0 +1,177 @@
+import Darwin
+import Foundation
+import WildlifeDomain
+
+package enum ProcessTerminationResult: Sendable, Equatable {
+    case signaled
+    case alreadyExited
+    case identityMismatch
+    case identityUnavailable
+    case inspectionUnavailable
+    case permissionDenied
+    case failed(Int32)
+}
+
+package enum ProcessInspector {
+    private struct Row {
+        let pid: Int32
+        let parentPID: Int32
+        let tty: String
+        let startIdentity: String
+        let command: String
+    }
+
+    package static func captureAgentProcess(
+        provider: AgentProvider,
+        startingAt pid: Int32 = getppid()
+    ) -> AgentProcessIdentity? {
+        let rows = snapshot()
+        let byPID = Dictionary(uniqueKeysWithValues: rows.map { ($0.pid, $0) })
+        var cursor = pid
+
+        for _ in 0..<12 {
+            guard let row = byPID[cursor] else { break }
+            if matches(row.command, provider: provider) {
+                return AgentProcessIdentity(
+                    pid: row.pid,
+                    startIdentity: row.startIdentity,
+                    tty: normalizedTTY(row.tty)
+                )
+            }
+            if row.parentPID <= 1 || row.parentPID == cursor { break }
+            cursor = row.parentPID
+        }
+        return nil
+    }
+
+    package static func isAlive(pid: Int32, startIdentity: String?) -> Bool {
+        switch liveness(pid: pid, startIdentity: startIdentity) {
+        case .matching, .unknown:
+            return true
+        case .notRunning, .identityMismatch:
+            return false
+        }
+    }
+
+    package static func liveness(pid: Int32, startIdentity: String?) -> ProcessLiveness {
+        guard pid > 1 else { return .notRunning }
+        let probeResult = kill(pid, 0)
+        let probeError = errno
+        if probeResult != 0 {
+            switch probeError {
+            case ESRCH:
+                return .notRunning
+            case EPERM:
+                break
+            default:
+                return .unknown
+            }
+        }
+        guard let startIdentity, !startIdentity.isEmpty else { return .matching }
+        guard let rows = snapshotResult(),
+              let row = rows.first(where: { $0.pid == pid }) else { return .unknown }
+        return row.startIdentity == startIdentity ? .matching : .identityMismatch
+    }
+
+    package static func liveness(_ process: AgentProcessIdentity) -> ProcessLiveness {
+        liveness(pid: process.pid, startIdentity: process.startIdentity)
+    }
+
+    package static func requestTermination(
+        pid: Int32,
+        startIdentity: String?
+    ) -> ProcessTerminationResult {
+        guard let startIdentity, !startIdentity.isEmpty else { return .identityUnavailable }
+        switch liveness(pid: pid, startIdentity: startIdentity) {
+        case .notRunning:
+            return .alreadyExited
+        case .identityMismatch:
+            return .identityMismatch
+        case .unknown:
+            return .inspectionUnavailable
+        case .matching:
+            break
+        }
+
+        let result = kill(pid, SIGTERM)
+        let terminationError = errno
+        guard result != 0 else { return .signaled }
+        switch terminationError {
+        case ESRCH:
+            return .alreadyExited
+        case EPERM:
+            return .permissionDenied
+        default:
+            return .failed(terminationError)
+        }
+    }
+
+    /// Returns the process and its ancestors, stopping before launchd. The app
+    /// uses this to find the GUI application that owns an active terminal.
+    package static func ancestorProcessIDs(startingAt pid: Int32, limit: Int = 32) -> [Int32] {
+        guard pid > 1, limit > 0 else { return [] }
+        let byPID = Dictionary(uniqueKeysWithValues: snapshot().map { ($0.pid, $0) })
+        var result: [Int32] = []
+        var visited = Set<Int32>()
+        var cursor = pid
+
+        for _ in 0..<limit {
+            guard cursor > 1,
+                  visited.insert(cursor).inserted,
+                  let row = byPID[cursor] else { break }
+            result.append(row.pid)
+            guard row.parentPID > 1, row.parentPID != cursor else { break }
+            cursor = row.parentPID
+        }
+        return result
+    }
+
+    private static func snapshot() -> [Row] {
+        snapshotResult() ?? []
+    }
+
+    private static func snapshotResult() -> [Row]? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,ppid=,tty=,lstart=,command="]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let output = String(data: data, encoding: .utf8) else { return nil }
+            return output.split(separator: "\n").compactMap(parse)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func parse(_ line: Substring) -> Row? {
+        let fields = line.split(whereSeparator: { $0.isWhitespace })
+        guard fields.count >= 9,
+              let pid = Int32(fields[0]),
+              let parent = Int32(fields[1]) else { return nil }
+        let start = fields[3...7].joined(separator: " ")
+        let command = fields[8...].joined(separator: " ")
+        return Row(pid: pid, parentPID: parent, tty: String(fields[2]), startIdentity: start, command: command)
+    }
+
+    private static func matches(_ command: String, provider: AgentProvider) -> Bool {
+        let value = command.lowercased()
+        guard !value.contains("wildlife-hook") else { return false }
+        switch provider {
+        case .codex:
+            return value == "codex" || value.contains("/codex ") || value.hasSuffix("/codex") || value.hasPrefix("codex ")
+        case .claude:
+            return value == "claude" || value.contains("/claude ") || value.hasSuffix("/claude") || value.hasPrefix("claude ") || value.contains("/.local/share/claude/")
+        }
+    }
+
+    private static func normalizedTTY(_ tty: String) -> String? {
+        guard tty != "??" && tty != "-" else { return nil }
+        return tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+    }
+}
