@@ -20,6 +20,8 @@ public enum SessionEventReducer {
 
         switch event.lifecycleEvent {
         case "SessionStart":
+            if session.createdAt == .distantPast { session.createdAt = event.timestamp }
+            if event.startSource == "fork" { session.isForkedSession = true }
             if event.startSource == "resume", wasTerminated { session.resumeCount += 1 }
             session.workflow = .inProgress
             session.runtimeStatus = .waitingForInput

@@ -10,14 +10,19 @@ final class NotchPanelController {
     private static let expandedWidth: CGFloat = 310
 
     private let repository: SessionRepository
+    private let focusSessionAction: (SessionRecord) -> Bool
     private let openManagerAction: () -> Void
     private let presentation = IslandPresentation()
-    private let terminalSessionFocus = TerminalSessionFocus()
     private var panel: NSPanel?
     private var cancellables = Set<AnyCancellable>()
 
-    init(repository: SessionRepository, openManager: @escaping () -> Void) {
+    init(
+        repository: SessionRepository,
+        focusSession: @escaping (SessionRecord) -> Bool,
+        openManager: @escaping () -> Void
+    ) {
         self.repository = repository
+        self.focusSessionAction = focusSession
         self.openManagerAction = openManager
         repository.objectWillChange
             .sink { [weak self] _ in
@@ -36,8 +41,7 @@ final class NotchPanelController {
     }
 
     private func refreshVisibility() {
-        guard !repository.activeSessions.isEmpty,
-              let screen = notchedBuiltInScreen(),
+        guard let screen = notchedBuiltInScreen(),
               geometry(for: screen) != nil else {
             presentation.collapse()
             panel?.orderOut(nil)
@@ -67,8 +71,9 @@ final class NotchPanelController {
         let hostingView = NotchHostingView(rootView: NotchIslandView(
             repository: repository,
             presentation: presentation,
-            focusSession: { [weak self] session in self?.focusSession(session) ?? false },
-            openManager: { [weak self] in self?.openManagerAction() }
+            focusSession: { [weak self] session in self?.focusSessionAction(session) ?? false },
+            openManager: { [weak self] in self?.openManagerAction() },
+            quitApplication: { NSApplication.shared.terminate(nil) }
         ))
         hostingView.configure(presentation: presentation)
         hostingView.autoresizingMask = [.width, .height]
@@ -76,20 +81,13 @@ final class NotchPanelController {
         return panel
     }
 
-    private func focusSession(_ session: SessionRecord) -> Bool {
-        let result = terminalSessionFocus.focus(session)
-        if !result.succeeded {
-            NSSound.beep()
-        }
-        return result.succeeded
-    }
-
     private func layoutPanel(on screen: NSScreen) {
         guard let panel,
               let geometry = geometry(for: screen) else { return }
         let count = min(repository.activeSessions.count, 8)
+        let visibleRowCount = max(count, 1)
         let expandedHeight = geometry.notchSize.height
-            + CGFloat(58 + count * 43 + (repository.activeSessions.count > 8 ? 24 : 0))
+            + CGFloat(58 + visibleRowCount * 43 + (repository.activeSessions.count > 8 ? 24 : 0))
         let expandedFrame = geometry.expandedFrame(width: Self.expandedWidth, height: expandedHeight)
         presentation.updateGeometry(geometry, expandedFrame: expandedFrame)
         let frame = geometry.panelFrame(

@@ -10,6 +10,8 @@ final class SessionRepository: ObservableObject {
     @Published private(set) var sessions: [SessionRecord] = []
     @Published var selectedSessionKey: String?
     @Published var searchText = ""
+    @Published var activeFilter = SessionFilter()
+    @Published private(set) var includesOlderSessions = false
 
     init(inMemory: Bool = false) throws {
         if inMemory {
@@ -22,6 +24,13 @@ final class SessionRepository: ObservableObject {
         let state = try diskStore.loadState()
         sessions = state.sessions
         deletedSessionKeys = Set(state.deletedSessionKeys)
+        let reconciled = SessionSupersession.reconcilePersistedActiveSessions(in: sessions)
+        let dead = SessionSupersession.finishDefinitivelyDeadSessions(
+            in: sessions,
+            liveness: ProcessInspector.liveness
+        )
+        let released = SessionHistoryPolicy.releaseOldAutomaticEmojis(in: sessions)
+        if reconciled > 0 || dead > 0 || released > 0 { persist() }
     }
 
     var selectedSession: SessionRecord? {
@@ -30,7 +39,8 @@ final class SessionRepository: ObservableObject {
     }
 
     var activeSessions: [SessionRecord] {
-        sessions.filter { $0.workflow == .inProgress }.sorted {
+        sessions.filter { $0.workflow == .inProgress && $0.archivedAt == nil }.sorted {
+            if $0.isPinned != $1.isPinned { return $0.isPinned }
             if $0.runtimeStatus.priority != $1.runtimeStatus.priority {
                 return $0.runtimeStatus.priority < $1.runtimeStatus.priority
             }
@@ -43,39 +53,63 @@ final class SessionRepository: ObservableObject {
         switch bucket {
         case .inProgress:
             return filtered.sorted {
-                ($0.runtimeStatus.priority, -$0.updatedAt.timeIntervalSince1970) <
+                if $0.isPinned != $1.isPinned { return $0.isPinned }
+                return ($0.runtimeStatus.priority, -$0.updatedAt.timeIntervalSince1970) <
                 ($1.runtimeStatus.priority, -$1.updatedAt.timeIntervalSince1970)
             }
         case .backlog:
             return filtered.sorted { $0.backlogOrder < $1.backlogOrder }
         case .completed:
-            return filtered.sorted { ($0.endedAt ?? $0.updatedAt) > ($1.endedAt ?? $1.updatedAt) }
+            return filtered.sorted {
+                if $0.isPinned != $1.isPinned { return $0.isPinned }
+                return ($0.endedAt ?? $0.updatedAt) > ($1.endedAt ?? $1.updatedAt)
+            }
         }
     }
 
     private var filteredSessions: [SessionRecord] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return sessions }
-        return sessions.filter {
-            [$0.displayTitle, $0.cwd, $0.provider.displayName, $0.sessionID, $0.notesMarkdown]
-                .contains { $0.lowercased().contains(query) }
+        return historyScopedSessions.filter { session in
+            guard activeFilter.matches(session) else { return false }
+            guard !query.isEmpty else { return true }
+            let values = [
+                session.displayTitle, session.cwd, session.provider.displayName,
+                session.sessionID, session.notesMarkdown, session.projectMetadata?.branch ?? "",
+            ] + session.tags
+            return values.contains { $0.lowercased().contains(query) }
         }
     }
 
-    func consume(_ event: BridgeEvent) {
-        guard event.isValidForTransport else { return }
+    private var historyScopedSessions: [SessionRecord] {
+        guard !includesOlderSessions else { return sessions }
+        let now = Date()
+        return sessions.filter { SessionHistoryPolicy.isVisibleByDefault($0, now: now) }
+    }
+
+    func showOlderSessions() {
+        includesOlderSessions = true
+    }
+
+    @discardableResult
+    func consume(
+        _ event: BridgeEvent,
+        rules: OrganizationRules = OrganizationRules()
+    ) -> SessionTransition? {
+        guard event.isValidForTransport else { return nil }
         let key = event.stableKey
         let restoresDeletedSession = deletedSessionKeys.contains(key)
         let session: SessionRecord
         if let existing = sessions.first(where: { $0.stableKey == key }) {
             session = existing
         } else {
-            guard event.tty != nil else { return }
+            guard event.tty != nil else { return nil }
             session = SessionRecord(
                 provider: event.provider,
                 sessionID: event.sessionID,
                 sourceTitle: "",
-                emoji: EmojiAllocator.next(used: Set(sessions.map(\.emoji))),
+                emoji: EmojiAllocator.next(
+                    used: SessionHistoryPolicy.reservedEmojis(in: sessions, now: event.timestamp)
+                ),
                 cwd: event.cwd,
                 createdAt: event.timestamp,
                 updatedAt: event.timestamp,
@@ -84,17 +118,48 @@ final class SessionRepository: ObservableObject {
             )
             sessions.append(session)
         }
-        guard SessionEventReducer.apply(event, to: session) else { return }
+        let previousStatus = session.runtimeStatus
+        let previousWorkflow = session.workflow
+        let previousEventAt = session.lastEventAt
+        guard SessionEventReducer.apply(event, to: session) else { return nil }
+        _ = SessionSupersession.finishSessionsSuperseded(by: event, in: sessions)
+        if session.workflow == .inProgress,
+           session.emoji == SessionHistoryPolicy.historicalEmoji {
+            session.emoji = EmojiAllocator.next(
+                used: SessionHistoryPolicy.reservedEmojis(in: sessions, now: event.timestamp)
+            )
+            session.emojiWasCustomized = false
+        }
+        SessionActivityRecorder.record(
+            event,
+            previousStatus: previousStatus,
+            previousWorkflow: previousWorkflow,
+            previousEventAt: previousEventAt,
+            in: session
+        )
+        session.attentionSnoozedUntil = nil
+        if session.archivedAt != nil, event.lifecycleEvent != "SessionEnd" {
+            session.archivedAt = nil
+        }
+        if session.workflow == .completed, SessionOrganization.shouldMoveToBacklog(session, rules: rules) {
+            session.workflow = .backlog
+            session.backlogOrder = nextBacklogOrder()
+        }
         if restoresDeletedSession {
             deletedSessionKeys.remove(key)
         }
         persist()
         objectWillChange.send()
+        return SessionTransition(
+            sessionKey: key,
+            event: event,
+            previousStatus: previousStatus,
+            currentStatus: session.runtimeStatus
+        )
     }
 
     func importSessions(_ imported: [ImportedSession]) -> Int {
         var count = 0
-        var usedEmoji = Set(sessions.map(\.emoji))
         var metadataChanged = false
         for item in imported where !deletedSessionKeys.contains(item.stableKey) {
             if let existing = sessions.first(where: { $0.stableKey == item.stableKey }) {
@@ -102,15 +167,21 @@ final class SessionRepository: ObservableObject {
                     existing.sourceTitle = item.title
                     metadataChanged = true
                 }
+                if existing.createdAt == .distantPast {
+                    existing.createdAt = item.createdAt
+                    metadataChanged = true
+                }
+                if existing.workflow == .completed, existing.endedAt == nil {
+                    existing.endedAt = item.updatedAt
+                    metadataChanged = true
+                }
                 continue
             }
-            let emoji = EmojiAllocator.next(used: usedEmoji)
-            usedEmoji.insert(emoji)
             let record = SessionRecord(
                 provider: item.provider,
                 sessionID: item.sessionID,
                 sourceTitle: item.title,
-                emoji: emoji,
+                emoji: SessionHistoryPolicy.historicalEmoji,
                 cwd: item.cwd,
                 createdAt: item.createdAt,
                 updatedAt: item.updatedAt,
@@ -142,7 +213,9 @@ final class SessionRepository: ObservableObject {
 
     func reorderBacklog(_ session: SessionRecord, before target: SessionRecord?) {
         guard session.workflow == .backlog else { return }
-        let ordered = sessions(in: .backlog).filter { $0.stableKey != session.stableKey }
+        let ordered = sessions
+            .filter { $0.workflow == .backlog && $0.stableKey != session.stableKey }
+            .sorted { $0.backlogOrder < $1.backlogOrder }
         var newOrder = ordered
         let index = target.flatMap { target in newOrder.firstIndex { $0.stableKey == target.stableKey } } ?? newOrder.endIndex
         newOrder.insert(session, at: index)
@@ -157,6 +230,7 @@ final class SessionRepository: ObservableObject {
             return "That emoji is already assigned to another session."
         }
         session.emoji = emoji
+        session.emojiWasCustomized = true
         persist()
         objectWillChange.send()
         return nil
@@ -219,6 +293,100 @@ final class SessionRepository: ObservableObject {
         objectWillChange.send()
     }
 
+    func session(forKey key: String) -> SessionRecord? {
+        sessions.first { $0.stableKey == key }
+    }
+
+    func updateProjectMetadata(_ metadata: ProjectMetadata?, forSessionKey key: String) {
+        guard let session = session(forKey: key), session.projectMetadata != metadata else { return }
+        session.projectMetadata = metadata
+        persist()
+        objectWillChange.send()
+    }
+
+    func updateTags(_ tags: [String], for session: SessionRecord) {
+        let normalized = TagNormalizer.normalizeAll(tags)
+        guard session.tags != normalized else { return }
+        session.tags = normalized
+        persist()
+        objectWillChange.send()
+    }
+
+    func togglePinned(_ session: SessionRecord) {
+        session.isPinned.toggle()
+        persist()
+        objectWillChange.send()
+    }
+
+    func setArchived(_ archived: Bool, for session: SessionRecord, now: Date = Date()) {
+        guard session.workflow != .inProgress else { return }
+        guard (session.archivedAt != nil) != archived else { return }
+        let value = archived ? now : nil
+        session.archivedAt = value
+        if archived, selectedSessionKey == session.stableKey { selectedSessionKey = nil }
+        persist()
+        objectWillChange.send()
+    }
+
+    func snooze(_ session: SessionRecord, until date: Date?) {
+        session.attentionSnoozedUntil = date
+        persist()
+        objectWillChange.send()
+    }
+
+    func clearExpiredSnoozes(now: Date = Date()) {
+        var changed = false
+        for session in sessions where session.attentionSnoozedUntil.map({ $0 <= now }) == true {
+            session.attentionSnoozedUntil = nil
+            changed = true
+        }
+        if changed {
+            persist()
+            objectWillChange.send()
+        }
+    }
+
+    func selectAdjacentSession(offset: Int) {
+        let visible = WorkflowBucket.allCases.flatMap { sessions(in: $0) }
+        guard !visible.isEmpty else { return }
+        let current = selectedSessionKey.flatMap { key in
+            visible.firstIndex { $0.stableKey == key }
+        }
+        let base = current ?? (offset > 0 ? -1 : visible.count)
+        let index = min(max(0, base + offset), visible.count - 1)
+        selectedSessionKey = visible[index].stableKey
+    }
+
+    func applyAutomaticArchive(rules: OrganizationRules, now: Date = Date()) {
+        var changed = false
+        for session in sessions where SessionOrganization.shouldAutoArchive(session, rules: rules, now: now) {
+            session.archivedAt = now
+            if selectedSessionKey == session.stableKey { selectedSessionKey = nil }
+            changed = true
+        }
+        if changed {
+            persist()
+            objectWillChange.send()
+        }
+    }
+
+    func releaseOldAutomaticEmojis(now: Date = Date()) {
+        guard SessionHistoryPolicy.releaseOldAutomaticEmojis(in: sessions, now: now) > 0 else { return }
+        persist()
+        objectWillChange.send()
+    }
+
+    var allTags: [String] {
+        TagNormalizer.normalizeAll(historyScopedSessions.flatMap(\.tags))
+    }
+
+    var projectChoices: [(key: String, name: String)] {
+        let pairs = historyScopedSessions.map { ($0.projectKey, $0.projectDisplayName) }
+        return Dictionary(pairs, uniquingKeysWith: { first, _ in first })
+            .map { (key: $0.key, name: $0.value) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     func delete(_ session: SessionRecord) {
         if selectedSessionKey == session.stableKey { selectedSessionKey = nil }
         deletedSessionKeys.insert(session.stableKey)
@@ -241,7 +409,11 @@ final class SessionRepository: ObservableObject {
         NSPasteboard.general.setString(command, forType: .string)
     }
 
-    func reconcileProcesses(now: Date = Date(), gracePeriod: TimeInterval = 15) {
+    func reconcileProcesses(
+        now: Date = Date(),
+        gracePeriod: TimeInterval = 15,
+        rules: OrganizationRules = OrganizationRules()
+    ) {
         var changed = false
         for session in sessions where session.workflow == .inProgress {
             guard let pid = session.processID else { continue }
@@ -252,11 +424,16 @@ final class SessionRepository: ObservableObject {
                 }
             } else if let missing = session.processMissingSince {
                 if now.timeIntervalSince(missing) >= gracePeriod {
+                    SessionActivityRecorder.recordProcessEnd(at: now, in: session)
                     session.workflow = .completed
                     session.runtimeStatus = .ended
                     session.endedAt = now
                     session.updatedAt = now
                     session.activeSubagentCount = 0
+                    if SessionOrganization.shouldMoveToBacklog(session, rules: rules) {
+                        session.workflow = .backlog
+                        session.backlogOrder = nextBacklogOrder()
+                    }
                     changed = true
                 }
             } else {
@@ -275,5 +452,9 @@ final class SessionRepository: ObservableObject {
             sessions: sessions,
             deletedSessionKeys: deletedSessionKeys.sorted()
         ))
+    }
+
+    private func nextBacklogOrder() -> Double {
+        (sessions.filter { $0.workflow == .backlog }.map(\.backlogOrder).max() ?? 0) + 1
     }
 }

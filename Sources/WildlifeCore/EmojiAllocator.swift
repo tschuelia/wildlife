@@ -27,6 +27,21 @@ public enum EmojiAllocator {
         return "🐾" + String(used.count + 1)
     }
 
+    package static func isAutomaticallyAllocated(_ candidate: String) -> Bool {
+        if candidate == SessionHistoryPolicy.historicalEmoji
+            || candidate == "🐾"
+            || orderedPool.contains(candidate) {
+            return true
+        }
+        if candidate.hasPrefix("🐾"), Int(candidate.dropFirst()) != nil {
+            return true
+        }
+        let parts = candidate.map(String.init)
+        guard parts.count == 2, parts[0] != parts[1] else { return false }
+        let seeds = Set(wildlife + nature)
+        return parts.allSatisfy(seeds.contains)
+    }
+
     public static func isSingleEmoji(_ candidate: String) -> Bool {
         guard candidate.count == 1, !candidate.isEmpty else { return false }
         let scalars = Array(candidate.unicodeScalars)

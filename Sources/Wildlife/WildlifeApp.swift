@@ -1,7 +1,9 @@
+import AppKit
 import SwiftUI
 
 @main
 struct WildlifeApp: App {
+    @NSApplicationDelegateAdaptor(WildlifeAppDelegate.self) private var appDelegate
     @StateObject private var settings: AppSettings
     @StateObject private var repository: SessionRepository
     @StateObject private var integrations: IntegrationManager
@@ -22,24 +24,36 @@ struct WildlifeApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Wildlife", id: "manager") {
+        Window("Wildlife", id: "manager") {
             ManagerView(
                 repository: repository,
                 settings: settings,
                 integrations: integrations,
                 runtime: runtime
             )
+            .environmentObject(runtime.sessionActions)
+            .environmentObject(runtime)
         }
         .defaultSize(width: 1_250, height: 760)
+        .commands {
+            SessionCommands(repository: repository, settings: settings, actions: runtime.sessionActions)
+        }
 
         MenuBarExtra("Wildlife", systemImage: "pawprint.fill") {
             WildlifeMenuContent(repository: repository, settings: settings, runtime: runtime)
+                .environmentObject(runtime.sessionActions)
         }
         .menuBarExtraStyle(.window)
 
         Settings {
             WildlifeSettingsView(settings: settings, integrations: integrations, runtime: runtime)
         }
+    }
+}
+
+private final class WildlifeAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 }
 

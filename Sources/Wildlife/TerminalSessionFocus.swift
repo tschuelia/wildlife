@@ -5,9 +5,24 @@ import WildlifeCore
 enum TerminalFocusResult: Equatable {
     case exactSession
     case owningApplication
-    case unavailable
+    case unavailable(TerminalFocusFailure)
+}
 
-    var succeeded: Bool { self != .unavailable }
+enum TerminalFocusFailure: Equatable {
+    case processUnavailable
+    case owningApplicationUnavailable
+    case activationRejected(String)
+
+    var message: String {
+        switch self {
+        case .processUnavailable:
+            "The recorded agent process is no longer available."
+        case .owningApplicationUnavailable:
+            "Wildlife could not identify the terminal or IDE that owns this session."
+        case let .activationRejected(name):
+            "macOS did not allow Wildlife to focus \(name)."
+        }
+    }
 }
 
 @MainActor
@@ -19,11 +34,14 @@ final class TerminalSessionFocus {
 
     func focus(_ session: SessionRecord) -> TerminalFocusResult {
         guard let processID = session.processID,
-              ProcessInspector.isAlive(pid: processID, startIdentity: session.processStartIdentity),
-              let application = owningApplication(startingAt: processID) else {
-            return .unavailable
+              ProcessInspector.isAlive(pid: processID, startIdentity: session.processStartIdentity) else {
+            return .unavailable(.processUnavailable)
+        }
+        guard let application = owningApplication(startingAt: processID) else {
+            return .unavailable(.owningApplicationUnavailable)
         }
 
+        prepareToActivate(application)
         switch application.bundleIdentifier {
         case BundleIdentifier.iTerm:
             if let tty = validatedTTY(session.tty), focusITerm(tty: tty) {
@@ -37,7 +55,10 @@ final class TerminalSessionFocus {
             break
         }
 
-        return activate(application) ? .owningApplication : .unavailable
+        let name = application.localizedName ?? "the originating application"
+        return activate(application)
+            ? .owningApplication
+            : .unavailable(.activationRejected(name))
     }
 
     private func owningApplication(startingAt processID: Int32) -> NSRunningApplication? {
@@ -51,10 +72,18 @@ final class TerminalSessionFocus {
     }
 
     private func activate(_ application: NSRunningApplication) -> Bool {
+        prepareToActivate(application)
+        return application.activate(
+            from: NSRunningApplication.current,
+            options: [.activateAllWindows]
+        )
+    }
+
+    private func prepareToActivate(_ application: NSRunningApplication) {
         if application.isHidden {
-            application.unhide()
+            _ = application.unhide()
         }
-        return application.activate(options: [.activateAllWindows])
+        NSApp.yieldActivation(to: application)
     }
 
     private func validatedTTY(_ tty: String?) -> String? {

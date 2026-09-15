@@ -6,7 +6,7 @@ Wildlife is a local metadata viewer for Codex and Claude Code. It has no network
 
 Wildlife protects its state from other macOS users. Processes already running as the current user, including Codex and Claude, are trusted and retain their normal filesystem access and provider-managed session separation. Wildlife is not an additional sandbox for an agent running as the same user.
 
-The app intentionally displays metadata from multiple sessions in one local UI. It never injects that metadata into a Codex or Claude session. Copying a session ID or resume command places that value on the system pasteboard only after an explicit user action.
+The app intentionally displays metadata from multiple sessions in one local UI. It never injects that metadata into a Codex or Claude session. Copying a session ID, path, or resume command places that value on the system pasteboard only after an explicit user action. Resuming a session requires confirmation before Wildlife asks the configured terminal application to run the command. Terminating an active session also requires confirmation; Wildlife revalidates the recorded PID and process-start identity before sending `SIGTERM`, never escalates to `SIGKILL`, and leaves the provider transcript untouched.
 
 ## Data retained locally
 
@@ -16,11 +16,13 @@ Wildlife may retain:
 - locally generated session title or summary
 - working directory, timestamps, lifecycle status, model, and tool name
 - process ID, process start identity, and terminal device
-- user-selected emoji, local notes, workflow position, and deletion tombstones
+- Git repository/worktree paths and branch name
+- metadata-only lifecycle activity (up to 500 recent entries) and lifetime duration/event-count rollups
+- user-selected emoji, tags, local notes, saved filters, pin/archive/snooze state, workflow position, and deletion tombstones
 
 State is stored in `~/Library/Application Support/Wildlife/Sessions.json`. Wildlife directories are mode `0700`; state, configuration backups, and inbox events are mode `0600`; the installed hook is mode `0700`.
 
-History import reads only the local Codex SQLite metadata database and Claude `sessions-index.json` files configured in Settings. It does not open transcript files.
+History import reads only the local Codex SQLite metadata database and Claude `sessions-index.json` files configured in Settings. It does not open transcript files. Activity history never contains prompts, transcript text, tool arguments, or tool results.
 
 ## Hook input and transport
 

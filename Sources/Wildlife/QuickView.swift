@@ -1,11 +1,12 @@
+import AppKit
 import SwiftUI
 import WildlifeCore
 
 struct QuickView: View {
+    @EnvironmentObject private var actions: SessionActionController
     @ObservedObject var repository: SessionRepository
     @ObservedObject var settings: AppSettings
     let openManager: (String?) -> Void
-    @State private var message: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -36,11 +37,16 @@ struct QuickView: View {
                         Spacer()
                         StatusDot(status: session.runtimeStatus)
                         Button {
+                            _ = actions.focus(session)
+                        } label: { Image(systemName: "scope") }
+                            .buttonStyle(.borderless)
+                            .help("Focus terminal session")
+                        Button {
                             do {
                                 try repository.copyResumeCommand(session, settings: settings)
-                                message = "Command copied"
+                                actions.message = "Command copied"
                             } catch {
-                                message = error.localizedDescription
+                                actions.message = error.localizedDescription
                             }
                         } label: { Image(systemName: "doc.on.doc") }
                             .buttonStyle(.borderless)
@@ -54,7 +60,16 @@ struct QuickView: View {
             HStack {
                 Button("Open Wildlife") { openManager(nil) }
                 Spacer()
-                if let message { Text(message).font(.caption).foregroundStyle(.secondary) }
+                if let message = actions.message {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .task(id: message) {
+                            try? await Task.sleep(for: .seconds(3))
+                            if actions.message == message { actions.message = nil }
+                        }
+                }
+                Button("Quit Wildlife") { NSApplication.shared.terminate(nil) }
             }
         }
         .padding(13)
@@ -145,6 +160,7 @@ struct NotchIslandView: View {
     @ObservedObject var presentation: IslandPresentation
     let focusSession: (SessionRecord) -> Bool
     let openManager: () -> Void
+    let quitApplication: () -> Void
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -170,6 +186,14 @@ struct NotchIslandView: View {
             if presentation.expanded {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
+                        Button {
+                            quitApplication()
+                        } label: {
+                            Image(systemName: "power")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Quit Wildlife")
+                        .accessibilityLabel("Quit Wildlife")
                         Label("Wildlife", systemImage: "pawprint.fill").font(.headline)
                         Spacer()
                         Button {
@@ -207,6 +231,22 @@ struct NotchIslandView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    if repository.activeSessions.isEmpty {
+                        HStack(spacing: 9) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.title3)
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Wildlife is running")
+                                    .font(.callout.bold())
+                                Text("No active sessions")
+                                    .font(.caption)
+                                    .foregroundStyle(.gray)
+                            }
+                            Spacer()
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
                     if repository.activeSessions.count > 8 {
                         Text("\(repository.activeSessions.count - 8) more in Wildlife")
                             .font(.caption).foregroundStyle(.gray)
@@ -228,6 +268,10 @@ struct NotchIslandView: View {
                     Text(session.emoji)
                         .font(.system(size: 18))
                         .accessibilityLabel(session.displayTitle)
+                } else {
+                    Image(systemName: "pawprint.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .accessibilityLabel("Wildlife")
                 }
             }
             .padding(.trailing, 7)
@@ -255,6 +299,12 @@ struct NotchIslandView: View {
                     .shadow(color: session.runtimeStatus.attentionColor.opacity(0.55), radius: 3)
                 } else if let session = repository.activeSessions.first {
                     StatusDot(status: session.runtimeStatus)
+                } else {
+                    Circle()
+                        .fill(.green)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: Color.green.opacity(0.55), radius: 3)
+                        .accessibilityLabel("Wildlife is running")
                 }
             }
             .padding(.leading, 7)
@@ -273,7 +323,9 @@ struct NotchIslandView: View {
     }
 
     private var compactAccessibilityLabel: String {
-        guard let session = repository.activeSessions.first else { return "No active sessions" }
+        guard let session = repository.activeSessions.first else {
+            return "Wildlife is running. No active sessions"
+        }
         let additional = repository.activeSessions.count - 1
         return additional > 0
             ? "\(session.displayTitle), \(session.runtimeStatus.displayName), and \(additional) more sessions"

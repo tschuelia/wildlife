@@ -1,7 +1,7 @@
 import Foundation
 
 public struct PersistedSessions: Codable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 4
     public var schemaVersion: Int
     public var sessions: [SessionRecord]
     public var deletedSessionKeys: [String]

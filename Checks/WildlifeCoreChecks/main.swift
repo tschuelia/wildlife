@@ -137,6 +137,262 @@ private func checkEmojiAllocation() throws {
     try check(!EmojiAllocator.isSingleEmoji("#"), "Plain hash was accepted as an emoji")
     try check(!EmojiAllocator.isSingleEmoji("*"), "Plain asterisk was accepted as an emoji")
     try check(!EmojiAllocator.isSingleEmoji("©"), "Text-presentation symbol was accepted as an emoji")
+    try check(EmojiAllocator.isAutomaticallyAllocated(first), "A pooled emoji was not recognized as automatic")
+    try check(EmojiAllocator.isAutomaticallyAllocated("🐾42"), "A fallback emoji was not recognized as automatic")
+    try check(!EmojiAllocator.isAutomaticallyAllocated("😀"), "An outside emoji was classified as automatic")
+}
+
+private func sessionFixture(
+    provider: AgentProvider = .claude,
+    id: String,
+    emoji: String = "🦓",
+    updatedAt: Date,
+    workflow: WorkflowBucket = .completed,
+    customized: Bool = false
+) -> SessionRecord {
+    SessionRecord(
+        provider: provider,
+        sessionID: id,
+        sourceTitle: id,
+        emoji: emoji,
+        cwd: "/tmp/project",
+        createdAt: updatedAt,
+        updatedAt: updatedAt,
+        workflow: workflow,
+        runtimeStatus: workflow == .inProgress ? .waitingForInput : .ended,
+        emojiWasCustomized: customized
+    )
+}
+
+private func checkSessionHistoryPolicy() throws {
+    let now = Date(timeIntervalSince1970: 2_000_000)
+    let recent = sessionFixture(id: "recent", emoji: "🦓", updatedAt: now.addingTimeInterval(-86_400))
+    recent.endedAt = now.addingTimeInterval(-3_599)
+    let boundary = sessionFixture(id: "boundary", emoji: "🦒", updatedAt: now)
+    boundary.endedAt = now.addingTimeInterval(-3_600)
+    let missingCompletion = sessionFixture(id: "missing-completion", emoji: "🐯", updatedAt: now)
+    let customized = sessionFixture(
+        id: "custom",
+        emoji: "😀",
+        updatedAt: now.addingTimeInterval(-8 * 86_400),
+        customized: true
+    )
+    customized.endedAt = now.addingTimeInterval(-8 * 86_400)
+    let active = sessionFixture(
+        id: "active",
+        emoji: "🐘",
+        updatedAt: now.addingTimeInterval(-30 * 86_400),
+        workflow: .inProgress
+    )
+    let backlog = sessionFixture(
+        id: "backlog",
+        emoji: "🦁",
+        updatedAt: now.addingTimeInterval(-30 * 86_400),
+        workflow: .backlog
+    )
+    backlog.endedAt = now.addingTimeInterval(-30 * 86_400)
+
+    try check(SessionHistoryPolicy.isVisibleByDefault(recent, now: now), "A recent session was hidden")
+    try check(!SessionHistoryPolicy.isVisibleByDefault(backlog, now: now), "An old inactive session was visible by default")
+    try check(SessionHistoryPolicy.isVisibleByDefault(active, now: now), "An old active session was hidden")
+    let sessions = [recent, boundary, missingCompletion, customized, active, backlog]
+    try check(
+        SessionHistoryPolicy.reservedEmojis(in: sessions, now: now) == ["🦓", "😀", "🐘", "🦁"],
+        "Expired emojis remained reserved before normalization"
+    )
+    try check(
+        SessionHistoryPolicy.releaseOldAutomaticEmojis(in: sessions, now: now) == 2,
+        "Completed emoji normalization changed the wrong number of sessions"
+    )
+    try check(recent.emoji == "🦓", "A recent completion released its emoji too early")
+    try check(boundary.emoji == SessionHistoryPolicy.historicalEmoji, "An emoji survived the one-hour boundary")
+    try check(missingCompletion.emoji == SessionHistoryPolicy.historicalEmoji, "A completion without an end time retained an emoji")
+    try check(customized.emoji == "😀", "A customized old emoji was overwritten")
+    try check(active.emoji == "🐘", "An active session released its emoji")
+    try check(backlog.emoji == "🦁", "A backlog session released its emoji")
+    let reserved = SessionHistoryPolicy.reservedEmojis(in: sessions, now: now)
+    try check(reserved == ["🦓", "😀", "🐘", "🦁"], "Released emojis still reserved preferred choices")
+}
+
+private func checkSessionSupersession() throws {
+    let old = sessionFixture(
+        id: "old-active",
+        updatedAt: Date(timeIntervalSince1970: 100),
+        workflow: .inProgress
+    )
+    old.processID = 123
+    old.processStartIdentity = "same-start"
+    old.tty = "/dev/ttys001"
+    let unrelated = sessionFixture(
+        id: "unrelated",
+        updatedAt: Date(timeIntervalSince1970: 100),
+        workflow: .inProgress
+    )
+    unrelated.processID = 456
+    unrelated.processStartIdentity = "other-start"
+    unrelated.tty = "/dev/ttys002"
+    let otherProvider = sessionFixture(
+        provider: .codex,
+        id: "other-provider",
+        updatedAt: Date(timeIntervalSince1970: 100),
+        workflow: .inProgress
+    )
+    otherProvider.processID = 123
+    otherProvider.processStartIdentity = "same-start"
+    otherProvider.tty = "/dev/ttys001"
+    let clear = BridgeEvent(
+        provider: .claude,
+        sessionID: "replacement",
+        lifecycleEvent: "SessionStart",
+        timestamp: Date(timeIntervalSince1970: 110),
+        cwd: "/tmp/project",
+        processID: 123,
+        processStartIdentity: "same-start",
+        tty: "/dev/ttys001",
+        startSource: "clear"
+    )
+
+    try check(
+        SessionSupersession.finishSessionsSuperseded(by: clear, in: [old, unrelated, otherProvider]) == 1,
+        "Clear did not supersede exactly one prior session"
+    )
+    try check(old.workflow == .completed && old.endedAt == clear.timestamp, "Cleared session remained active")
+    try check(old.activities.last?.endReason == "clear", "Clear reason was not retained")
+    try check(unrelated.workflow == .inProgress, "Clear superseded another process")
+    try check(otherProvider.workflow == .inProgress, "Clear superseded another provider")
+
+    let ordinary = sessionFixture(
+        id: "ordinary-start-source",
+        updatedAt: Date(timeIntervalSince1970: 111),
+        workflow: .inProgress
+    )
+    ordinary.processID = 777
+    ordinary.processStartIdentity = "ordinary-process"
+    let ordinaryStart = BridgeEvent(
+        provider: .claude,
+        sessionID: "ordinary-replacement",
+        lifecycleEvent: "SessionStart",
+        timestamp: Date(timeIntervalSince1970: 112),
+        cwd: "/tmp/project",
+        processID: 777,
+        processStartIdentity: "ordinary-process"
+    )
+    try check(
+        SessionSupersession.finishSessionsSuperseded(by: ordinaryStart, in: [ordinary]) == 1
+            && ordinary.workflow == .completed,
+        "A replacement start without a clear/resume source left the prior session active"
+    )
+
+    let ttyOnly = sessionFixture(
+        id: "tty-only",
+        updatedAt: Date(timeIntervalSince1970: 115),
+        workflow: .inProgress
+    )
+    ttyOnly.tty = "/dev/ttys003"
+    let ttyResume = BridgeEvent(
+        provider: .claude,
+        sessionID: "tty-replacement",
+        lifecycleEvent: "SessionStart",
+        timestamp: Date(timeIntervalSince1970: 120),
+        cwd: "/tmp/project",
+        tty: "/dev/ttys003",
+        startSource: "resume"
+    )
+    try check(
+        SessionSupersession.finishSessionsSuperseded(by: ttyResume, in: [ttyOnly]) == 1
+            && ttyOnly.workflow == .completed,
+        "TTY fallback did not supersede an identity without process metadata"
+    )
+
+    let forked = sessionFixture(
+        id: "fork-source",
+        updatedAt: Date(timeIntervalSince1970: 120),
+        workflow: .inProgress
+    )
+    forked.processID = 123
+    forked.processStartIdentity = "same-start"
+    let fork = BridgeEvent(
+        provider: .claude,
+        sessionID: "fork-target",
+        lifecycleEvent: "SessionStart",
+        timestamp: Date(timeIntervalSince1970: 130),
+        cwd: "/tmp/project",
+        processID: 123,
+        processStartIdentity: "same-start",
+        startSource: "fork"
+    )
+    try check(
+        SessionSupersession.finishSessionsSuperseded(by: fork, in: [forked]) == 0
+            && forked.workflow == .inProgress,
+        "A fork incorrectly superseded its source session"
+    )
+
+    let stale = sessionFixture(
+        id: "persisted-stale",
+        updatedAt: Date(timeIntervalSince1970: 200),
+        workflow: .inProgress
+    )
+    stale.processID = 900
+    stale.processStartIdentity = "persisted-start"
+    let newest = sessionFixture(
+        id: "persisted-newest",
+        updatedAt: Date(timeIntervalSince1970: 210),
+        workflow: .inProgress
+    )
+    newest.processID = 900
+    newest.processStartIdentity = "persisted-start"
+    let recycled = sessionFixture(
+        id: "recycled-pid",
+        updatedAt: Date(timeIntervalSince1970: 205),
+        workflow: .inProgress
+    )
+    recycled.processID = 900
+    recycled.processStartIdentity = "different-start"
+    let persistedFork = sessionFixture(
+        id: "persisted-fork",
+        updatedAt: Date(timeIntervalSince1970: 215),
+        workflow: .inProgress
+    )
+    persistedFork.processID = 900
+    persistedFork.processStartIdentity = "persisted-start"
+    persistedFork.isForkedSession = true
+    try check(
+        SessionSupersession.reconcilePersistedActiveSessions(in: [stale, newest, recycled, persistedFork]) == 1,
+        "Persisted duplicate reconciliation changed the wrong records"
+    )
+    try check(stale.workflow == .completed && newest.workflow == .inProgress, "Newest persisted session was not retained")
+    try check(recycled.workflow == .inProgress, "A recycled PID was treated as the same agent process")
+    try check(persistedFork.workflow == .inProgress, "A persisted fork was treated as a stale duplicate")
+
+    let launchTime = Date(timeIntervalSince1970: 220)
+    let deadAtLaunch = sessionFixture(id: "dead-at-launch", updatedAt: launchTime, workflow: .inProgress)
+    deadAtLaunch.processID = 901
+    let reusedAtLaunch = sessionFixture(id: "reused-at-launch", updatedAt: launchTime, workflow: .inProgress)
+    reusedAtLaunch.processID = 902
+    let aliveAtLaunch = sessionFixture(id: "alive-at-launch", updatedAt: launchTime, workflow: .inProgress)
+    aliveAtLaunch.processID = 903
+    let unknownAtLaunch = sessionFixture(id: "unknown-at-launch", updatedAt: launchTime, workflow: .inProgress)
+    unknownAtLaunch.processID = 904
+    let pidlessAtLaunch = sessionFixture(id: "pidless-at-launch", updatedAt: launchTime, workflow: .inProgress)
+    try check(
+        SessionSupersession.finishDefinitivelyDeadSessions(
+            in: [deadAtLaunch, reusedAtLaunch, aliveAtLaunch, unknownAtLaunch, pidlessAtLaunch],
+            liveness: { pid, _ in
+                switch pid {
+                case 901: .notRunning
+                case 902: .identityMismatch
+                case 903: .matching
+                default: .unknown
+                }
+            }
+        ) == 2,
+        "Startup cleanup did not close exactly the definitively dead sessions"
+    )
+    try check(deadAtLaunch.workflow == .completed, "A missing startup process remained active")
+    try check(reusedAtLaunch.workflow == .completed, "A reused startup PID remained active")
+    try check(aliveAtLaunch.workflow == .inProgress, "A live startup process was closed")
+    try check(unknownAtLaunch.workflow == .inProgress, "An uninspectable startup process was closed")
+    try check(pidlessAtLaunch.workflow == .inProgress, "A PID-less startup session was closed")
 }
 
 private func checkSessionPersistence() throws {
@@ -277,6 +533,7 @@ private func checkEventReduction() throws {
     )
     try check(SessionEventReducer.apply(resumed, to: session), "Resume event was not applied")
     try check(session.workflow == .inProgress && session.resumeCount == 1, "Resume transition was incorrect")
+    try check(session.createdAt == Date(timeIntervalSince1970: 1), "Resume overwrote the original session start")
     try check(!SessionEventReducer.apply(resumed, to: session), "Duplicate event was applied")
 
     let ended = BridgeEvent(
@@ -309,6 +566,24 @@ private func checkEventReduction() throws {
         cwd: "/tmp/claude"
     )
     try check(!SessionEventReducer.apply(otherProviderEvent, to: session), "Another provider mutated the target session")
+
+    let missingStart = sessionFixture(
+        id: "missing-start",
+        updatedAt: Date(timeIntervalSince1970: 10),
+        workflow: .completed
+    )
+    missingStart.createdAt = .distantPast
+    let startTimestamp = Date(timeIntervalSince1970: 11)
+    let start = BridgeEvent(
+        eventID: "missing-start-event",
+        provider: missingStart.provider,
+        sessionID: missingStart.sessionID,
+        lifecycleEvent: "SessionStart",
+        timestamp: startTimestamp,
+        cwd: missingStart.cwd
+    )
+    try check(SessionEventReducer.apply(start, to: missingStart), "Start event was not applied to a legacy session")
+    try check(missingStart.createdAt == startTimestamp, "A known start time did not repair missing session metadata")
 }
 
 private func checkLocalEventTransport() throws {
@@ -614,6 +889,14 @@ private func checkNotchGeometry() throws {
 
 private func checkProcessAncestry() throws {
     let processID = ProcessInfo.processInfo.processIdentifier
+    try check(
+        ProcessInspector.liveness(pid: processID, startIdentity: nil) == .matching,
+        "The current process was not detected as live"
+    )
+    try check(
+        ProcessInspector.requestTermination(pid: processID, startIdentity: nil) == .identityUnavailable,
+        "Termination was not refused when process identity was unavailable"
+    )
     let ancestors = ProcessInspector.ancestorProcessIDs(startingAt: processID)
     try check(ancestors.first == processID, "Process ancestry did not begin with the requested process")
     try check(Set(ancestors).count == ancestors.count, "Process ancestry contained a cycle")
@@ -662,6 +945,206 @@ private func checkHistoricalImport() throws {
     try check(!claude.contains { $0.title == "must not be used" }, "Claude first prompt leaked into imported metadata")
 }
 
+private func checkSessionIntelligencePersistence() throws {
+    let legacy = Data(#"{"providerRaw":"codex","sessionID":"legacy-session"}"#.utf8)
+    let migrated = try JSONDecoder().decode(SessionRecord.self, from: legacy)
+    try check(migrated.activities.isEmpty, "Legacy session gained activity details")
+    try check(migrated.activitySummary == SessionActivitySummary(), "Legacy session gained activity rollups")
+    try check(migrated.tags.isEmpty && !migrated.isPinned, "Legacy session gained organization metadata")
+    try check(migrated.archivedAt == nil && migrated.attentionSnoozedUntil == nil, "Legacy session gained lifecycle dates")
+    try check(!migrated.emojiWasCustomized, "Legacy fallback emoji was treated as customized")
+
+    let metadata = ProjectMetadata(
+        repositoryRoot: "/tmp/repository",
+        worktreeRoot: "/tmp/repository-feature",
+        gitCommonDirectory: "/tmp/repository/.git",
+        branch: "feature/saved-views"
+    )
+    migrated.projectMetadata = metadata
+    migrated.tags = ["urgent", "backend"]
+    migrated.isPinned = true
+    migrated.emojiWasCustomized = true
+    migrated.isForkedSession = true
+    migrated.activitySummary.toolCount = 14
+    migrated.activities = [SessionActivity(
+        id: "metadata-event",
+        timestamp: Date(timeIntervalSince1970: 10),
+        eventName: "PreToolUse",
+        status: .runningTool,
+        toolName: "Read",
+        endReason: nil,
+        notificationType: nil,
+        subagentCount: 0
+    )]
+    let roundTripped = try JSONDecoder().decode(SessionRecord.self, from: JSONEncoder().encode(migrated))
+    try check(roundTripped.projectMetadata == metadata, "Git project metadata was not persisted")
+    try check(roundTripped.tags == ["urgent", "backend"] && roundTripped.isPinned, "Organization metadata was not persisted")
+    try check(roundTripped.emojiWasCustomized, "Emoji customization provenance was not persisted")
+    try check(roundTripped.isForkedSession, "Fork provenance was not persisted")
+    try check(roundTripped.activitySummary.toolCount == 14 && roundTripped.activities.count == 1, "Activity metadata was not persisted")
+}
+
+private func checkSessionActivityAndAttention() throws {
+    let start = Date(timeIntervalSince1970: 1_000)
+    let session = SessionRecord(
+        provider: .claude,
+        sessionID: "activity-session",
+        sourceTitle: "Activity",
+        emoji: "🦉",
+        cwd: "/tmp/project",
+        createdAt: start,
+        updatedAt: start,
+        workflow: .inProgress,
+        runtimeStatus: .processing
+    )
+    let permission = BridgeEvent(
+        eventID: UUID().uuidString,
+        provider: .claude,
+        sessionID: session.sessionID,
+        lifecycleEvent: "PermissionRequest",
+        timestamp: start.addingTimeInterval(10),
+        cwd: session.cwd,
+        toolName: "Bash"
+    )
+    session.runtimeStatus = .waitingForApproval
+    SessionActivityRecorder.record(
+        permission,
+        previousStatus: .processing,
+        previousWorkflow: .inProgress,
+        previousEventAt: start,
+        in: session
+    )
+    try check(session.activitySummary.activeDuration == 10, "Active duration was not rolled up")
+    try check(session.activitySummary.permissionCount == 1, "Permission count was not recorded")
+    try check(session.attentionReason(at: start.addingTimeInterval(11)) == .approval, "Approval attention was not detected")
+    session.attentionSnoozedUntil = start.addingTimeInterval(100)
+    try check(session.attentionReason(at: start.addingTimeInterval(11)) == nil, "Snoozed attention remained visible")
+    try check(session.unsnoozedAttentionReason == .approval, "Snooze erased the underlying attention reason")
+
+    for index in 0..<(SessionActivityRecorder.detailLimit + 2) {
+        let event = BridgeEvent(
+            eventID: UUID().uuidString,
+            provider: .claude,
+            sessionID: session.sessionID,
+            lifecycleEvent: "PreToolUse",
+            timestamp: start.addingTimeInterval(Double(20 + index)),
+            cwd: session.cwd,
+            toolName: "Read"
+        )
+        SessionActivityRecorder.record(
+            event,
+            previousStatus: .processing,
+            previousWorkflow: .completed,
+            previousEventAt: start,
+            in: session
+        )
+    }
+    try check(session.activities.count == SessionActivityRecorder.detailLimit, "Detailed activity retention was not capped")
+    try check(session.activitySummary.toolCount == SessionActivityRecorder.detailLimit + 2, "Lifetime tool rollup was pruned with details")
+
+    let failed = BridgeEvent(
+        eventID: UUID().uuidString,
+        provider: .claude,
+        sessionID: session.sessionID,
+        lifecycleEvent: "StopFailure",
+        timestamp: start.addingTimeInterval(1_000),
+        cwd: session.cwd
+    )
+    SessionActivityRecorder.record(
+        failed,
+        previousStatus: .processing,
+        previousWorkflow: .completed,
+        previousEventAt: start,
+        in: session
+    )
+    try check(session.lastTurnOutcome == .failed, "Failure outcome was not retained for automation")
+}
+
+private func checkFilteringAndOrganization() throws {
+    let now = Date(timeIntervalSince1970: 2_000_000)
+    let session = SessionRecord(
+        provider: .codex,
+        sessionID: "filter-session",
+        sourceTitle: "Release migration",
+        emoji: "🦓",
+        cwd: "/tmp/repository",
+        createdAt: now.addingTimeInterval(-3_600),
+        updatedAt: now.addingTimeInterval(-60),
+        workflow: .inProgress,
+        runtimeStatus: .waitingForInput
+    )
+    session.projectMetadata = ProjectMetadata(
+        repositoryRoot: "/tmp/repository",
+        worktreeRoot: "/tmp/repository",
+        gitCommonDirectory: "/tmp/repository/.git",
+        branch: "release"
+    )
+    session.tags = TagNormalizer.normalizeAll([" Urgent ", "backend", "URGENT", ""])
+    session.isPinned = true
+    try check(session.tags == ["backend", "urgent"], "Tags were not normalized and deduplicated")
+    try check(SessionFilter(query: "release", providerRaws: ["codex"], projectKeys: [session.projectKey], tags: ["urgent"], recentDays: 1, pinnedOnly: true).matches(session, now: now), "Combined session filter rejected a match")
+    try check(!SessionFilter(providerRaws: ["claude"]).matches(session, now: now), "Provider filter accepted another provider")
+    try check(SessionFilter(attentionOnly: true).matches(session, now: now), "Attention view rejected waiting input")
+    session.attentionSnoozedUntil = now.addingTimeInterval(60)
+    try check(!SessionFilter(attentionOnly: true).matches(session, now: now), "Attention view retained a snoozed session")
+
+    session.workflow = .completed
+    session.runtimeStatus = .ended
+    session.endedAt = now.addingTimeInterval(-31 * 86_400)
+    session.isPinned = false
+    let archiveRules = OrganizationRules(autoArchiveAfterDays: 30)
+    try check(SessionOrganization.shouldAutoArchive(session, rules: archiveRules, now: now), "Expired completed session was not auto-archived")
+    session.isPinned = true
+    try check(!SessionOrganization.shouldAutoArchive(session, rules: archiveRules, now: now), "Pinned session was auto-archived")
+    session.lastTurnOutcome = .failed
+    try check(SessionOrganization.shouldMoveToBacklog(session, rules: OrganizationRules(backlogFailedSessions: true)), "Failed-session backlog rule did not apply")
+
+    let sibling = SessionRecord(
+        provider: .claude,
+        sessionID: "sibling",
+        sourceTitle: "Sibling",
+        emoji: "🦊",
+        cwd: session.cwd,
+        createdAt: now,
+        updatedAt: now,
+        workflow: .inProgress,
+        runtimeStatus: .processing
+    )
+    session.workflow = .inProgress
+    sibling.projectMetadata = ProjectMetadata(
+        repositoryRoot: "/tmp/repository",
+        worktreeRoot: "/tmp/repository",
+        gitCommonDirectory: "/tmp/repository/.git",
+        branch: "release"
+    )
+    session.projectMetadata = sibling.projectMetadata
+    try check(SessionOrganization.conflictingWorktreeKeys(in: [session, sibling]) == ["/tmp/repository"], "Shared active worktree was not flagged")
+}
+
+private func checkProjectInspectionAndActions() throws {
+    let parsed = GitProjectInspector.parse(output: "/tmp/repository-worktree\n/tmp/repository/.git\nfeature/activity\n")
+    try check(parsed?.repositoryRoot == "/tmp/repository", "Linked-worktree repository root was parsed incorrectly")
+    try check(parsed?.worktreeRoot == "/tmp/repository-worktree", "Worktree root was parsed incorrectly")
+    try check(parsed?.branch == "feature/activity", "Git branch was parsed incorrectly")
+    try check(GitProjectInspector.parse(output: "missing\nlines\n") == nil, "Incomplete Git metadata was accepted")
+
+    let escaped = AppleScriptEscaper.stringLiteral(#"one "two"\path"# + "\nnext")
+    try check(escaped.contains(#"\"two\""#), "AppleScript quotes were not escaped")
+    try check(escaped.contains(#"\\path"#), "AppleScript backslash was not escaped")
+    try check(escaped.contains(" & linefeed & "), "AppleScript newline was not safely joined")
+
+    let approval = BridgeEvent(provider: .codex, sessionID: "notify", lifecycleEvent: "PermissionRequest", cwd: "/tmp")
+    let transition = SessionTransition(
+        sessionKey: "codex:notify",
+        event: approval,
+        previousStatus: .runningTool,
+        currentStatus: .waitingForApproval
+    )
+    try check(SessionNotificationDecision.kind(for: transition) == .approval, "Approval notification was not selected")
+    let completion = BridgeEvent(provider: .codex, sessionID: "notify", lifecycleEvent: "SessionEnd", cwd: "/tmp")
+    try check(SessionNotificationDecision.kind(for: SessionTransition(sessionKey: "codex:notify", event: completion, previousStatus: .waitingForInput, currentStatus: .ended)) == .completion, "Completion notification was not selected")
+}
+
 @main
 struct WildlifeCoreChecks {
     static func main() {
@@ -669,6 +1152,8 @@ struct WildlifeCoreChecks {
             try runCheck("resume templates", checkResumeTemplates)
             try runCheck("hook metadata boundary", checkHookMetadataBoundary)
             try runCheck("emoji allocation", checkEmojiAllocation)
+            try runCheck("session history policy", checkSessionHistoryPolicy)
+            try runCheck("session supersession", checkSessionSupersession)
             try runCheck("session persistence", checkSessionPersistence)
             try runCheck("backlog ordering", checkBacklogOrderPlanning)
             try runCheck("event reduction", checkEventReduction)
@@ -677,6 +1162,10 @@ struct WildlifeCoreChecks {
             try runCheck("notch geometry", checkNotchGeometry)
             try runCheck("process ancestry", checkProcessAncestry)
             try runCheck("historical import", checkHistoricalImport)
+            try runCheck("session intelligence persistence", checkSessionIntelligencePersistence)
+            try runCheck("session activity and attention", checkSessionActivityAndAttention)
+            try runCheck("filtering and organization", checkFilteringAndOrganization)
+            try runCheck("project inspection and actions", checkProjectInspectionAndActions)
             print("WildlifeCoreChecks: \(checkCount) checks passed")
         } catch {
             FileHandle.standardError.write(Data("WildlifeCoreChecks failed: \(error.localizedDescription)\n".utf8))

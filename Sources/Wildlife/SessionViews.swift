@@ -8,31 +8,40 @@ struct ManagerView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var integrations: IntegrationManager
     @ObservedObject var runtime: AppRuntime
+    @EnvironmentObject private var actions: SessionActionController
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
     @State private var showingOnboarding = false
 
     var body: some View {
-        HSplitView {
-            SessionBoard(repository: repository, settings: settings)
-                .frame(minWidth: 720)
-            Group {
-                if let session = repository.selectedSession {
-                    SessionDetail(session: session, repository: repository, settings: settings)
-                        .id(session.stableKey)
-                } else {
-                    ContentUnavailableView(
-                        "Select a session",
-                        systemImage: "pawprint",
-                        description: Text("Titles, notes, keys, and resume actions appear here.")
-                    )
+        GeometryReader { proxy in
+            HStack(spacing: 0) {
+                SessionBoard(repository: repository, settings: settings, runtime: runtime)
+                    .frame(minWidth: 720, maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
+                Divider()
+                Group {
+                    if let session = repository.selectedSession {
+                        SessionDetail(session: session, repository: repository, settings: settings)
+                            .id(session.stableKey)
+                    } else {
+                        ContentUnavailableView(
+                            "Select a session",
+                            systemImage: "pawprint",
+                            description: Text("Titles, notes, keys, and resume actions appear here.")
+                        )
+                    }
                 }
+                .frame(width: detailSidebarWidth(for: proxy.size.width))
+                .frame(maxHeight: .infinity)
             }
-            .frame(minWidth: 330, idealWidth: 390)
         }
         .navigationTitle("Wildlife")
         .searchable(text: $repository.searchText, placement: .toolbar, prompt: "Search sessions")
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                SessionViewToolbar(repository: repository, settings: settings)
+            }
             ToolbarItem(placement: .automatic) {
                 Button { openSettings() } label: { Label("Settings", systemImage: "gear") }
             }
@@ -49,6 +58,57 @@ struct ManagerView: View {
                 showingOnboarding = false
             }
         }
+        .confirmationDialog(
+            "Resume session in \(settings.preferredTerminal.displayName)?",
+            isPresented: Binding(
+                get: { pendingResumeSession != nil },
+                set: { if !$0 { actions.pendingResumeSessionKey = nil } }
+            ),
+            presenting: pendingResumeSession
+        ) { session in
+            Button("Run Resume Command") { actions.confirmResume(session) }
+            Button("Cancel", role: .cancel) { actions.pendingResumeSessionKey = nil }
+        } message: { session in
+            Text((try? actions.renderedResumeCommand(for: session)) ?? "The resume command is invalid.")
+        }
+        .confirmationDialog(
+            "Terminate this session?",
+            isPresented: Binding(
+                get: { pendingTerminationSession != nil },
+                set: { if !$0 { actions.pendingTerminationSessionKey = nil } }
+            ),
+            presenting: pendingTerminationSession
+        ) { session in
+            Button("Terminate Session", role: .destructive) { actions.confirmTermination(session) }
+            Button("Cancel", role: .cancel) { actions.pendingTerminationSessionKey = nil }
+        } message: { _ in
+            Text("Wildlife will send SIGTERM to the verified agent process. The transcript will remain available to resume later.")
+        }
+        .overlay(alignment: .bottom) {
+            if let message = actions.message {
+                Text(message)
+                    .font(.callout)
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding()
+                    .task {
+                        try? await Task.sleep(for: .seconds(3))
+                        if actions.message == message { actions.message = nil }
+                    }
+            }
+        }
+    }
+
+    private var pendingResumeSession: SessionRecord? {
+        actions.pendingResumeSessionKey.flatMap(repository.session(forKey:))
+    }
+
+    private var pendingTerminationSession: SessionRecord? {
+        actions.pendingTerminationSessionKey.flatMap(repository.session(forKey:))
+    }
+
+    private func detailSidebarWidth(for windowWidth: CGFloat) -> CGFloat {
+        min(390, max(330, windowWidth * 0.30))
     }
 }
 
@@ -137,26 +197,62 @@ private final class SessionDragCoordinator: ObservableObject {
 struct SessionBoard: View {
     @ObservedObject var repository: SessionRepository
     @ObservedObject var settings: AppSettings
+    @ObservedObject var runtime: AppRuntime
     @StateObject private var dragCoordinator = SessionDragCoordinator()
 
     var body: some View {
-        GeometryReader { proxy in
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 14) {
-                    ForEach(WorkflowBucket.allCases) { bucket in
-                        SessionColumn(
-                            bucket: bucket,
-                            repository: repository,
-                            settings: settings,
-                            dragCoordinator: dragCoordinator
-                        )
+        VStack(spacing: 0) {
+            if !conflictingWorktrees.isEmpty {
+                Label(
+                    "Multiple active sessions share \(conflictingWorktrees.count == 1 ? "a worktree" : "worktrees")",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 18)
+                .padding(.top, 10)
+            }
+            HStack(alignment: .top, spacing: 14) {
+                ForEach(WorkflowBucket.allCases) { bucket in
+                    SessionColumn(
+                        bucket: bucket,
+                        repository: repository,
+                        settings: settings,
+                        dragCoordinator: dragCoordinator
+                    )
+                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
+            if !repository.includesOlderSessions || runtime.isImportingOlderHistory {
+                Divider()
+                HStack(spacing: 10) {
+                    Text("Showing active sessions and the last 7 days.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if runtime.isImportingOlderHistory {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading older sessions…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button("Load older sessions") { runtime.importOlderHistory() }
                     }
                 }
-                .frame(height: max(0, proxy.size.height - 32), alignment: .top)
-                .padding()
+                .padding(.horizontal, 18)
+                .padding(.vertical, 10)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var conflictingWorktrees: Set<String> {
+        SessionOrganization.conflictingWorktreeKeys(in: repository.activeSessions)
     }
 }
 
@@ -174,6 +270,7 @@ struct SessionColumn: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject fileprivate var dragCoordinator: SessionDragCoordinator
     @State private var cardFrames: [String: CGRect] = [:]
+    @State private var collapsedProjectKeys = Set<String>()
 
     private var records: [SessionRecord] {
         dragCoordinator.records(in: bucket, repository: repository)
@@ -194,32 +291,7 @@ struct SessionColumn: View {
 
             ScrollView {
                 LazyVStack(spacing: 9) {
-                    ForEach(records, id: \.stableKey) { session in
-                        VStack(spacing: 0) {
-                            if showsInsertionMarker(before: session) {
-                                Capsule()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 3)
-                                    .padding(.horizontal, 8)
-                                    .padding(.bottom, 6)
-                            }
-                            SessionCard(session: session, repository: repository, settings: settings)
-                                .opacity(dragCoordinator.draggedKey == session.stableKey ? 0.38 : 1)
-                                .background {
-                                    GeometryReader { proxy in
-                                        Color.clear.preference(
-                                            key: SessionCardFramePreferenceKey.self,
-                                            value: [session.stableKey: proxy.frame(in: .named(coordinateSpaceName))]
-                                        )
-                                    }
-                                }
-                                .sessionDragSource(
-                                    session: session,
-                                    repository: repository,
-                                    coordinator: dragCoordinator
-                                )
-                        }
-                    }
+                    recordsContent
                     if records.isEmpty {
                         Text(emptyMessage)
                             .font(.callout)
@@ -232,8 +304,7 @@ struct SessionColumn: View {
             }
         }
         .padding(12)
-        .frame(width: 300)
-        .frame(maxHeight: .infinity, alignment: .top)
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14))
         .overlay {
             RoundedRectangle(cornerRadius: 14)
@@ -249,12 +320,91 @@ struct SessionColumn: View {
             of: [UTType.utf8PlainText],
             delegate: SessionColumnDropDelegate(
                 bucket: bucket,
-                records: records,
+                records: visuallyOrderedRecords,
                 cardFrames: cardFrames,
                 repository: repository,
                 coordinator: dragCoordinator
             )
         )
+    }
+
+    @ViewBuilder
+    private var recordsContent: some View {
+        if settings.groupByProject {
+            ForEach(projectGroups, id: \.key) { group in
+                DisclosureGroup(
+                    isExpanded: Binding(
+                        get: { !collapsedProjectKeys.contains(group.key) },
+                        set: { expanded in
+                            if expanded { collapsedProjectKeys.remove(group.key) }
+                            else { collapsedProjectKeys.insert(group.key) }
+                        }
+                    )
+                ) {
+                    VStack(spacing: 9) {
+                        ForEach(group.records, id: \.stableKey) { session in
+                            sessionRow(session)
+                        }
+                    }
+                    .padding(.top, 7)
+                } label: {
+                    HStack {
+                        Text(group.name)
+                            .font(.caption.bold())
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(group.records.count)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 3)
+            }
+        } else {
+            ForEach(records, id: \.stableKey) { session in
+                sessionRow(session)
+            }
+        }
+    }
+
+    private var projectGroups: [(key: String, name: String, records: [SessionRecord])] {
+        let grouped = Dictionary(grouping: records, by: \.projectKey)
+        return grouped.map { key, records in
+            (key: key, name: records.first?.projectDisplayName ?? "Unknown Project", records: records)
+        }.sorted { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private var visuallyOrderedRecords: [SessionRecord] {
+        settings.groupByProject ? projectGroups.flatMap(\.records) : records
+    }
+
+    private func sessionRow(_ session: SessionRecord) -> some View {
+        VStack(spacing: 0) {
+            if showsInsertionMarker(before: session) {
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(height: 3)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+            }
+            SessionCard(session: session, repository: repository, settings: settings)
+                .opacity(dragCoordinator.draggedKey == session.stableKey ? 0.38 : 1)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: SessionCardFramePreferenceKey.self,
+                            value: [session.stableKey: proxy.frame(in: .named(coordinateSpaceName))]
+                        )
+                    }
+                }
+                .sessionDragSource(
+                    session: session,
+                    repository: repository,
+                    coordinator: dragCoordinator
+                )
+        }
     }
 
     private func showsInsertionMarker(before session: SessionRecord) -> Bool {
@@ -342,6 +492,7 @@ struct SessionCard: View {
     let session: SessionRecord
     @ObservedObject var repository: SessionRepository
     @ObservedObject var settings: AppSettings
+    @EnvironmentObject private var actions: SessionActionController
     @State private var copied = false
     @State private var confirmingDelete = false
 
@@ -358,6 +509,11 @@ struct SessionCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if session.isPinned {
+                    Image(systemName: "pin.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 StatusDot(status: session.runtimeStatus)
             }
             if session.workflow == .inProgress {
@@ -382,10 +538,27 @@ struct SessionCard: View {
                 }
                 .foregroundStyle(.secondary)
             }
-            Text(URL(fileURLWithPath: session.cwd).lastPathComponent)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+            HStack(spacing: 5) {
+                if let metadata = session.projectMetadata {
+                    Label(metadata.branch, systemImage: "arrow.triangle.branch")
+                    if hasWorktreeConflict {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .help("Another active session uses this worktree")
+                    }
+                } else {
+                    Text(URL(fileURLWithPath: session.cwd).lastPathComponent)
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
+            if !session.tags.isEmpty {
+                Text(session.tags.map { "#\($0)" }.joined(separator: "  "))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .padding(11)
         .contentShape(Rectangle())
@@ -395,9 +568,18 @@ struct SessionCard: View {
                 : Color(nsColor: .controlBackgroundColor),
             in: RoundedRectangle(cornerRadius: 11)
         )
-        .onTapGesture { repository.selectedSessionKey = session.stableKey }
+        .gesture(
+            TapGesture(count: 2)
+                .exclusively(before: TapGesture(count: 1))
+                .onEnded { gesture in
+                    repository.selectedSessionKey = session.stableKey
+                    if case .first = gesture, session.workflow == .inProgress {
+                        _ = actions.focus(session)
+                    }
+                }
+        )
         .contextMenu {
-            SessionContextMenu(
+            SessionActionItems(
                 session: session,
                 repository: repository,
                 settings: settings,
@@ -416,37 +598,113 @@ struct SessionCard: View {
         if session.activeSubagentCount > 0 { return "\(session.runtimeStatus.displayName) · \(session.activeSubagentCount) subagent(s)" }
         return session.runtimeStatus.displayName
     }
+
+    private var hasWorktreeConflict: Bool {
+        guard let path = session.projectMetadata?.worktreeRoot else { return false }
+        return SessionOrganization.conflictingWorktreeKeys(in: repository.activeSessions).contains(path)
+    }
 }
 
-private struct SessionContextMenu: View {
+private struct SessionActionItems: View {
     let session: SessionRecord
     @ObservedObject var repository: SessionRepository
     @ObservedObject var settings: AppSettings
+    @EnvironmentObject private var actions: SessionActionController
+    @EnvironmentObject private var runtime: AppRuntime
     @Binding var confirmingDelete: Bool
     var report: (String) -> Void = { _ in }
 
     var body: some View {
-        Button("Copy Session Key") {
+        if session.workflow == .inProgress {
+            Button { _ = actions.focus(session) } label: {
+                Label("Focus Terminal", systemImage: "scope")
+            }
+            Button(role: .destructive) {
+                actions.requestTermination(session)
+            } label: {
+                Label(
+                    actions.isTerminationRequested(session) ? "Terminating…" : "Terminate Session…",
+                    systemImage: "stop.circle"
+                )
+            }
+            .disabled(actions.isTerminationRequested(session))
+        } else {
+            Button { actions.requestResume(session) } label: {
+                Label("Resume Session…", systemImage: "play.circle")
+            }
+        }
+        Button { actions.revealRepository(session) } label: {
+            Label("Reveal Repository in Finder", systemImage: "folder")
+        }
+        Button { actions.openInTerminal(session) } label: {
+            Label("Open Project in Terminal", systemImage: "terminal")
+        }
+        Button { actions.copyPath(session) } label: {
+            Label("Copy Project Path", systemImage: "doc.on.doc")
+        }
+        Divider()
+        Button {
             repository.copyKey(session)
             report("Session key copied")
+        } label: {
+            Label("Copy Session Key", systemImage: "key")
         }
-        Button("Copy Resume Command") {
+        Button {
             do {
                 try repository.copyResumeCommand(session, settings: settings)
                 report("Resume command copied")
             } catch {
                 report(error.localizedDescription)
             }
+        } label: {
+            Label("Copy Resume Command", systemImage: "terminal.fill")
+        }
+        Button { repository.togglePinned(session) } label: {
+            Label(
+                session.isPinned ? "Unpin" : "Pin",
+                systemImage: session.isPinned ? "pin.slash" : "pin"
+            )
+        }
+        if session.workflow != .inProgress {
+            Button {
+                repository.setArchived(session.archivedAt == nil, for: session)
+            } label: {
+                Label(
+                    session.archivedAt == nil ? "Archive" : "Restore",
+                    systemImage: session.archivedAt == nil ? "archivebox" : "arrow.uturn.backward"
+                )
+            }
+        }
+        if session.attentionReason() != nil {
+            Menu {
+                Button("15 Minutes") { runtime.snooze(session, until: Date().addingTimeInterval(900)) }
+                Button("1 Hour") { runtime.snooze(session, until: Date().addingTimeInterval(3_600)) }
+                Button("Until Tomorrow") { runtime.snooze(session, until: tomorrowMorning) }
+            } label: {
+                Label("Snooze Attention", systemImage: "clock")
+            }
         }
         if session.workflow == .completed {
             Divider()
-            Button("Move to Backlog") { repository.move(session, to: .backlog) }
+            Button { repository.move(session, to: .backlog) } label: {
+                Label("Move to Backlog", systemImage: "tray")
+            }
         } else if session.workflow == .backlog {
             Divider()
-            Button("Mark Completed") { repository.move(session, to: .completed) }
+            Button { repository.move(session, to: .completed) } label: {
+                Label("Mark Completed", systemImage: "checkmark.circle")
+            }
         }
         Divider()
-        Button("Remove from Wildlife", role: .destructive) { confirmingDelete = true }
+        Button(role: .destructive) { confirmingDelete = true } label: {
+            Label("Remove from Wildlife", systemImage: "trash")
+        }
+    }
+
+    private var tomorrowMorning: Date {
+        let calendar = Calendar.current
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: Date()) ?? Date().addingTimeInterval(86_400)
+        return calendar.date(bySettingHour: 9, minute: 0, second: 0, of: tomorrow) ?? tomorrow
     }
 }
 
@@ -474,16 +732,14 @@ extension RuntimeStatus {
 }
 
 private struct InlineSessionIdentityEditor: View {
-    private enum Field: Hashable { case emoji, title }
-
     let session: SessionRecord
     @ObservedObject var repository: SessionRepository
-    @State private var editingField: Field?
+    @State private var isEditingTitle = false
     @State private var titleDraft = ""
-    @State private var emojiDraft = ""
-    @State private var originalDraft = ""
+    @State private var originalTitleDraft = ""
     @State private var emojiError: String?
-    @FocusState private var focusedField: Field?
+    @State private var emojiPickerRequestID = 0
+    @FocusState private var isTitleFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -497,90 +753,136 @@ private struct InlineSessionIdentityEditor: View {
                     .foregroundStyle(.red)
             }
         }
-        .onChange(of: focusedField) { oldValue, newValue in
-            guard newValue == nil, let oldValue, editingField == oldValue else { return }
-            commit(oldValue)
+        .onChange(of: isTitleFocused) { oldValue, newValue in
+            guard oldValue, !newValue, isEditingTitle else { return }
+            commitTitle()
         }
     }
 
-    @ViewBuilder
     private var emojiControl: some View {
-        if editingField == .emoji {
-            TextField("Emoji", text: $emojiDraft)
-                .font(.system(size: 38))
-                .textFieldStyle(.plain)
-                .frame(width: 54)
-                .focused($focusedField, equals: .emoji)
-                .onSubmit { commit(.emoji) }
-                .onExitCommand { cancel() }
-        } else {
+        Button(action: openEmojiPicker) {
             Text(session.emoji)
                 .font(.system(size: 44))
                 .contentShape(Rectangle())
-                .onTapGesture { beginEditing(.emoji) }
-                .help("Click to edit emoji")
+        }
+        .buttonStyle(.plain)
+        .help("Choose session emoji")
+        .accessibilityLabel("Change session emoji")
+        .background {
+            EmojiCharacterPickerBridge(requestID: emojiPickerRequestID) { selection in
+                applyEmoji(selection)
+            }
+            .frame(width: 1, height: 1)
+            .accessibilityHidden(true)
         }
     }
 
     @ViewBuilder
     private var titleControl: some View {
-        if editingField == .title {
+        if isEditingTitle {
             TextField("Session title", text: $titleDraft)
                 .font(.title2.bold())
                 .textFieldStyle(.plain)
-                .focused($focusedField, equals: .title)
-                .onSubmit { commit(.title) }
-                .onExitCommand { cancel() }
+                .focused($isTitleFocused)
+                .onSubmit { commitTitle() }
+                .onExitCommand { cancelTitleEditing() }
         } else {
             Text(session.displayTitle)
                 .font(.title2.bold())
                 .lineLimit(2)
                 .contentShape(Rectangle())
-                .onTapGesture { beginEditing(.title) }
+                .onTapGesture { beginTitleEditing() }
                 .help("Click to edit title")
         }
     }
 
-    private func beginEditing(_ field: Field) {
+    private func openEmojiPicker() {
         emojiError = nil
-        editingField = field
-        switch field {
-        case .emoji:
-            emojiDraft = session.emoji
-            originalDraft = emojiDraft
-        case .title:
-            titleDraft = session.customTitle ?? session.displayTitle
-            originalDraft = titleDraft
-        }
-        focusedField = field
+        if isEditingTitle { commitTitle() }
+        emojiPickerRequestID &+= 1
     }
 
-    private func commit(_ field: Field) {
-        guard editingField == field else { return }
-        editingField = nil
-        focusedField = nil
-
-        switch field {
-        case .emoji:
-            guard emojiDraft != originalDraft else { return }
-            if let error = repository.updateCustomEmoji(emojiDraft, for: session) {
-                emojiDraft = session.emoji
-                emojiError = error
-            } else {
-                emojiError = nil
-            }
-        case .title:
-            guard titleDraft != originalDraft else { return }
-            repository.updateCustomTitle(titleDraft, for: session)
+    private func applyEmoji(_ emoji: String) {
+        guard emoji != session.emoji else {
+            emojiError = nil
+            return
         }
+        emojiError = repository.updateCustomEmoji(emoji, for: session)
     }
 
-    private func cancel() {
-        editingField = nil
-        focusedField = nil
-        emojiDraft = session.emoji
+    private func beginTitleEditing() {
+        emojiError = nil
+        titleDraft = session.customTitle ?? session.displayTitle
+        originalTitleDraft = titleDraft
+        isEditingTitle = true
+        isTitleFocused = true
+    }
+
+    private func commitTitle() {
+        guard isEditingTitle else { return }
+        isEditingTitle = false
+        isTitleFocused = false
+        guard titleDraft != originalTitleDraft else { return }
+        repository.updateCustomTitle(titleDraft, for: session)
+    }
+
+    private func cancelTitleEditing() {
+        isEditingTitle = false
+        isTitleFocused = false
         titleDraft = session.customTitle ?? session.displayTitle
         emojiError = nil
+    }
+}
+
+private struct EmojiCharacterPickerBridge: NSViewRepresentable {
+    let requestID: Int
+    let onSelection: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> EmojiCaptureTextView {
+        let view = EmojiCaptureTextView()
+        view.drawsBackground = false
+        view.isEditable = true
+        view.isSelectable = true
+        view.textColor = .clear
+        view.insertionPointColor = .clear
+        view.onInsert = onSelection
+        return view
+    }
+
+    func updateNSView(_ nsView: EmojiCaptureTextView, context: Context) {
+        nsView.onInsert = onSelection
+        guard context.coordinator.presentedRequestID != requestID else { return }
+        context.coordinator.presentedRequestID = requestID
+        DispatchQueue.main.async { [weak nsView] in
+            guard let nsView, let window = nsView.window else { return }
+            window.makeFirstResponder(nsView)
+            NSApplication.shared.orderFrontCharacterPalette(nil)
+        }
+    }
+
+    final class Coordinator {
+        var presentedRequestID = 0
+    }
+}
+
+private final class EmojiCaptureTextView: NSTextView {
+    var onInsert: ((String) -> Void)?
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        let value: String
+        if let attributedString = insertString as? NSAttributedString {
+            value = attributedString.string
+        } else if let string = insertString as? String {
+            value = string
+        } else {
+            return
+        }
+        guard !value.isEmpty else { return }
+        onInsert?(value)
     }
 }
 
@@ -594,13 +896,32 @@ struct SessionDetail: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 4) {
-                    InlineSessionIdentityEditor(session: session, repository: repository)
-                    Label(session.provider.displayName, systemImage: session.provider == .codex ? "terminal" : "sparkles")
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        InlineSessionIdentityEditor(session: session, repository: repository)
+                        Label(
+                            session.provider.displayName,
+                            systemImage: session.provider == .codex ? "terminal" : "sparkles"
+                        )
                         .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Menu {
+                        SessionActionItems(
+                            session: session,
+                            repository: repository,
+                            settings: settings,
+                            confirmingDelete: $confirmingDelete,
+                            report: { copyMessage = $0 }
+                        )
+                    } label: {
+                        Label("Actions", systemImage: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
                 }
                 .contextMenu {
-                    SessionContextMenu(
+                    SessionActionItems(
                         session: session,
                         repository: repository,
                         settings: settings,
@@ -609,34 +930,41 @@ struct SessionDetail: View {
                     )
                 }
 
-                GroupBox("Identity") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        LabeledContent("Project", value: session.cwd)
-                        LabeledContent("Session key") {
-                            Text(session.sessionID).font(.caption.monospaced()).textSelection(.enabled)
+                GroupBox("Details") {
+                    VStack(alignment: .leading, spacing: 0) {
+                        SessionPropertyRow(
+                            key: "Repository",
+                            value: session.projectMetadata?.repositoryRoot ?? session.cwd
+                        )
+                        Divider()
+                        if let metadata = session.projectMetadata {
+                            SessionPropertyRow(key: "Worktree", value: metadata.worktreeRoot)
+                            Divider()
+                            SessionPropertyRow(key: "Branch", value: metadata.branch)
+                            Divider()
                         }
+                        SessionPropertyRow(key: "Working directory", value: session.cwd)
+                        if session.createdAt != .distantPast {
+                            Divider()
+                            SessionPropertyRow(
+                                key: "Started",
+                                value: session.createdAt.formatted(date: .abbreviated, time: .standard)
+                            )
+                        }
+                        Divider()
+                        SessionPropertyRow(key: "Session key", value: session.sessionID, monospaced: true)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 4)
                 }
 
-                GroupBox("Actions") {
-                    HStack {
-                        Button("Copy key") { repository.copyKey(session); copyMessage = "Session key copied" }
-                        Button("Copy resume command") {
-                            do {
-                                try repository.copyResumeCommand(session, settings: settings)
-                                copyMessage = "Resume command copied"
-                            } catch {
-                                copyMessage = error.localizedDescription
-                            }
-                        }
-                        if session.workflow == .completed {
-                            Button("Move to Backlog") { repository.move(session, to: .backlog) }
-                        } else if session.workflow == .backlog {
-                            Button("Mark Completed") { repository.move(session, to: .completed) }
-                        }
-                    }
-                    .padding(.top, 4)
+                GroupBox("Tags") {
+                    SessionTagEditor(session: session, repository: repository)
+                        .padding(.top, 4)
+                }
+
+                GroupBox("Activity") {
+                    SessionActivityView(session: session)
                 }
 
                 GroupBox("Notes") {
@@ -669,5 +997,26 @@ struct SessionDetail: View {
         } message: {
             Text("The Codex or Claude session and transcript remain untouched.")
         }
+    }
+}
+
+private struct SessionPropertyRow: View {
+    let key: String
+    let value: String
+    var monospaced = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(key)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(monospaced ? .caption.monospaced() : .callout)
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 8)
     }
 }

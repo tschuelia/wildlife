@@ -5,18 +5,28 @@ import WildlifeCore
 
 @MainActor
 final class AppRuntime: ObservableObject {
+    @Published private(set) var isImportingOlderHistory = false
+
     private let repository: SessionRepository
     private let settings: AppSettings
     private let server = LocalEventServer()
+    let sessionActions: SessionActionController
+    private let notifications = AttentionNotificationController()
     private var timer: Timer?
     private var started = false
     private var reconciliationTicks = 0
     private var notchController: NotchPanelController?
     private var openManagerWindow: (() -> Void)?
+    private var projectMetadataInFlight = Set<String>()
+    private var inspectedProjectCWD: [String: String] = [:]
 
     init(repository: SessionRepository, settings: AppSettings) {
         self.repository = repository
         self.settings = settings
+        sessionActions = SessionActionController(repository: repository, settings: settings)
+        notifications.configure { [weak self] action, key in
+            self?.handleNotificationAction(action, sessionKey: key)
+        }
     }
 
     func start(openManager: (() -> Void)? = nil) {
@@ -25,9 +35,9 @@ final class AppRuntime: ObservableObject {
         started = true
         replayInbox()
         do {
-            try server.start { [weak repository] event in
+            try server.start { [weak self] event in
                 Task { @MainActor in
-                    repository?.consume(event)
+                    self?.consumeLive(event)
                     if let spoolURL = RuntimePaths.spoolURL(eventID: event.eventID) {
                         try? SecureLocalFile.removeOwnedFileOrLink(at: spoolURL)
                     }
@@ -39,16 +49,32 @@ final class AppRuntime: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
-        notchController = NotchPanelController(repository: repository) { [weak self] in
-            self?.openManager()
-        }
-        importHistory(since: Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast) {
+        notchController = NotchPanelController(
+            repository: repository,
+            focusSession: { [weak self] session in
+                guard let self else { return false }
+                guard sessionActions.focus(session) else {
+                    self.openManager(sessionKey: session.stableKey)
+                    return false
+                }
+                return true
+            },
+            openManager: { [weak self] in self?.openManager() }
+        )
+        repository.applyAutomaticArchive(rules: settings.organizationRules)
+        refreshProjectMetadata(for: repository.sessions)
+        importHistory(since: SessionHistoryPolicy.cutoff()) {
             self.settings.initialImportCompleted = true
         }
     }
 
     func importOlderHistory() {
-        importHistory(since: .distantPast, completion: nil)
+        repository.showOlderSessions()
+        guard !isImportingOlderHistory else { return }
+        isImportingOlderHistory = true
+        importHistory(since: .distantPast) { [weak self] in
+            self?.isImportingOlderHistory = false
+        }
     }
 
     func openManager(sessionKey: String? = nil) {
@@ -57,12 +83,37 @@ final class AppRuntime: ObservableObject {
         openManagerWindow?()
     }
 
+    func setNotificationsEnabled(_ enabled: Bool) {
+        guard enabled else {
+            settings.notificationsEnabled = false
+            for session in repository.sessions {
+                notifications.cancelSnooze(for: session.stableKey)
+            }
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            settings.notificationsEnabled = await notifications.requestAuthorization()
+        }
+    }
+
+    func snooze(_ session: SessionRecord, until date: Date) {
+        repository.snooze(session, until: date)
+        if settings.notificationsEnabled {
+            notifications.scheduleSnooze(for: session, until: date)
+        }
+    }
+
     private func tick() {
         reconciliationTicks += 1
-        repository.reconcileProcesses()
+        repository.clearExpiredSnoozes()
+        repository.reconcileProcesses(rules: settings.organizationRules)
+        repository.releaseOldAutomaticEmojis()
         replayInbox()
         if reconciliationTicks.isMultiple(of: 12) {
-            importHistory(since: Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast)
+            repository.applyAutomaticArchive(rules: settings.organizationRules)
+            refreshProjectMetadata(for: repository.activeSessions, refreshingExisting: true)
+            importHistory(since: SessionHistoryPolicy.cutoff())
         }
     }
 
@@ -88,7 +139,7 @@ final class AppRuntime: ObservableObject {
             return (url, event)
         }.sorted { $0.1.timestamp < $1.1.timestamp }
         for (url, event) in events {
-            repository.consume(event)
+            _ = repository.consume(event, rules: settings.organizationRules)
             try? SecureLocalFile.removeOwnedFileOrLink(at: url)
         }
     }
@@ -102,7 +153,53 @@ final class AppRuntime: ObservableObject {
         Task { [weak self] in
             let sessions = await importTask.value
             _ = self?.repository.importSessions(sessions)
+            if let self { self.refreshProjectMetadata(for: self.repository.sessions) }
             completion?()
+        }
+    }
+
+    private func consumeLive(_ event: BridgeEvent) {
+        guard let transition = repository.consume(event, rules: settings.organizationRules),
+              let session = repository.session(forKey: transition.sessionKey) else { return }
+        if session.attentionReason() == nil {
+            notifications.cancelSnooze(for: session.stableKey)
+        }
+        notifications.notify(transition: transition, session: session, settings: settings)
+        refreshProjectMetadata(for: [session])
+    }
+
+    private func handleNotificationAction(_ action: WildlifeNotificationAction, sessionKey: String) {
+        guard let session = repository.session(forKey: sessionKey) else { return }
+        switch action {
+        case .open:
+            openManager(sessionKey: sessionKey)
+        case .focus:
+            if !sessionActions.focus(session) { openManager(sessionKey: sessionKey) }
+        case .snooze:
+            snooze(session, until: Date().addingTimeInterval(3_600))
+        }
+    }
+
+    private func refreshProjectMetadata(
+        for sessions: [SessionRecord],
+        refreshingExisting: Bool = false
+    ) {
+        for session in sessions {
+            let key = session.stableKey
+            let cwd = session.cwd
+            guard !cwd.isEmpty,
+                  (refreshingExisting || inspectedProjectCWD[key] != cwd),
+                  projectMetadataInFlight.insert(key).inserted else { continue }
+            inspectedProjectCWD[key] = cwd
+            let task = Task.detached(priority: .utility) {
+                GitProjectInspector().inspect(cwd: cwd)
+            }
+            Task { [weak self] in
+                let metadata = await task.value
+                guard let self else { return }
+                projectMetadataInFlight.remove(key)
+                repository.updateProjectMetadata(metadata, forSessionKey: key)
+            }
         }
     }
 }

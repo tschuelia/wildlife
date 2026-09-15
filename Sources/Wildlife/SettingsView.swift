@@ -39,6 +39,39 @@ struct WildlifeSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Notifications") {
+                Toggle("Enable attention notifications", isOn: Binding(
+                    get: { settings.notificationsEnabled },
+                    set: { runtime.setNotificationsEnabled($0) }
+                ))
+                Group {
+                    Toggle("Approvals", isOn: $settings.notificationApproval)
+                    Toggle("Waiting for input", isOn: $settings.notificationInput)
+                    Toggle("Failures", isOn: $settings.notificationFailure)
+                    Toggle("Completions", isOn: $settings.notificationCompletion)
+                }
+                .disabled(!settings.notificationsEnabled)
+                Text("Permission is requested only when notifications are enabled. Replayed and imported history stays silent.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("Organization") {
+                Toggle("Group lanes by repository", isOn: $settings.groupByProject)
+                Picker("Preferred terminal", selection: $settings.preferredTerminal) {
+                    ForEach(PreferredTerminal.allCases) { terminal in
+                        Text(terminal.displayName).tag(terminal)
+                    }
+                }
+                Picker("Automatically archive completed sessions", selection: $settings.autoArchiveDays) {
+                    Text("Never").tag(0)
+                    Text("After 7 days").tag(7)
+                    Text("After 30 days").tag(30)
+                    Text("After 90 days").tag(90)
+                }
+                Toggle("Move failed sessions to Backlog when they end", isOn: $settings.backlogFailedSessions)
+                Toggle("Move interrupted sessions to Backlog when they end", isOn: $settings.backlogInterruptedSessions)
+            }
+
             Section("Startup and history") {
                 Toggle("Launch Wildlife at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { oldValue, newValue in
@@ -46,10 +79,11 @@ struct WildlifeSettingsView: View {
                         updateLaunchAtLogin(newValue)
                     }
                 if let launchError { Text(launchError).font(.caption).foregroundStyle(.red) }
-                Button("Import all older sessions") {
+                Button(runtime.isImportingOlderHistory ? "Loading older sessions…" : "Load all older sessions") {
                     runtime.importOlderHistory()
                     importMessage = "Older local indexes are being imported."
                 }
+                .disabled(runtime.isImportingOlderHistory)
                 if let importMessage { Text(importMessage).font(.caption).foregroundStyle(.secondary) }
             }
 
@@ -60,7 +94,7 @@ struct WildlifeSettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
-        .frame(width: 620, height: 670)
+        .frame(width: 640, height: 780)
     }
 
     @ViewBuilder

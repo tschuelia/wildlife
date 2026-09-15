@@ -7,6 +7,23 @@ public struct AgentProcessIdentity: Sendable, Equatable {
     public let tty: String?
 }
 
+package enum ProcessLiveness: Sendable, Equatable {
+    case matching
+    case notRunning
+    case identityMismatch
+    case unknown
+}
+
+package enum ProcessTerminationResult: Sendable, Equatable {
+    case signaled
+    case alreadyExited
+    case identityMismatch
+    case identityUnavailable
+    case inspectionUnavailable
+    case permissionDenied
+    case failed(Int32)
+}
+
 public enum ProcessInspector {
     private struct Row {
         let pid: Int32
@@ -48,9 +65,61 @@ public enum ProcessInspector {
     }
 
     public static func isAlive(pid: Int32, startIdentity: String?) -> Bool {
-        guard kill(pid, 0) == 0 || errno == EPERM else { return false }
-        guard let startIdentity, !startIdentity.isEmpty else { return true }
-        return snapshot().first(where: { $0.pid == pid })?.startIdentity == startIdentity
+        switch liveness(pid: pid, startIdentity: startIdentity) {
+        case .matching, .unknown:
+            return true
+        case .notRunning, .identityMismatch:
+            return false
+        }
+    }
+
+    package static func liveness(pid: Int32, startIdentity: String?) -> ProcessLiveness {
+        guard pid > 1 else { return .notRunning }
+        let probeResult = kill(pid, 0)
+        let probeError = errno
+        if probeResult != 0 {
+            switch probeError {
+            case ESRCH:
+                return .notRunning
+            case EPERM:
+                break
+            default:
+                return .unknown
+            }
+        }
+        guard let startIdentity, !startIdentity.isEmpty else { return .matching }
+        guard let rows = snapshotResult(),
+              let row = rows.first(where: { $0.pid == pid }) else { return .unknown }
+        return row.startIdentity == startIdentity ? .matching : .identityMismatch
+    }
+
+    package static func requestTermination(
+        pid: Int32,
+        startIdentity: String?
+    ) -> ProcessTerminationResult {
+        guard let startIdentity, !startIdentity.isEmpty else { return .identityUnavailable }
+        switch liveness(pid: pid, startIdentity: startIdentity) {
+        case .notRunning:
+            return .alreadyExited
+        case .identityMismatch:
+            return .identityMismatch
+        case .unknown:
+            return .inspectionUnavailable
+        case .matching:
+            break
+        }
+
+        let result = kill(pid, SIGTERM)
+        let terminationError = errno
+        guard result != 0 else { return .signaled }
+        switch terminationError {
+        case ESRCH:
+            return .alreadyExited
+        case EPERM:
+            return .permissionDenied
+        default:
+            return .failed(terminationError)
+        }
     }
 
     /// Returns the process and its ancestors, stopping before launchd. The app
@@ -74,6 +143,10 @@ public enum ProcessInspector {
     }
 
     private static func snapshot() -> [Row] {
+        snapshotResult() ?? []
+    }
+
+    private static func snapshotResult() -> [Row]? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
         process.arguments = ["-axo", "pid=,ppid=,tty=,lstart=,command="]
@@ -84,10 +157,11 @@ public enum ProcessInspector {
             try process.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            guard let output = String(data: data, encoding: .utf8) else { return [] }
+            guard process.terminationStatus == 0,
+                  let output = String(data: data, encoding: .utf8) else { return nil }
             return output.split(separator: "\n").compactMap(parse)
         } catch {
-            return []
+            return nil
         }
     }
 
