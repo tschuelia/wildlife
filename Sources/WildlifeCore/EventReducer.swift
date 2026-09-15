@@ -4,6 +4,7 @@ public enum SessionEventReducer {
     @discardableResult
     public static func apply(_ event: BridgeEvent, to session: SessionRecord) -> Bool {
         guard event.schemaVersion == BridgeEvent.currentSchemaVersion else { return false }
+        guard event.provider == session.provider, event.sessionID == session.sessionID else { return false }
         guard event.eventID != session.lastEventID else { return false }
         guard event.timestamp >= session.lastEventAt else { return false }
 

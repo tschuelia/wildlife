@@ -14,8 +14,19 @@ final class IntegrationManager: ObservableObject {
 
     init(settings: AppSettings) {
         self.settings = settings
+        refresh()
+        refreshInstalledBridgeIfNeeded()
         repairExistingIntegrations()
         refresh()
+    }
+
+    private func refreshInstalledBridgeIfNeeded() {
+        guard codexState != .notInstalled || claudeState != .notInstalled else { return }
+        do {
+            try installBridge()
+        } catch {
+            lastError = "Bridge update: \(error.localizedDescription)"
+        }
     }
 
     private func repairExistingIntegrations() {
@@ -42,7 +53,7 @@ final class IntegrationManager: ObservableObject {
             lastMessage = "Updated existing \(names) handlers. Restart or resume active sessions. Backups: \(backups.joined(separator: ", "))"
         }
         if !errors.isEmpty {
-            lastError = errors.joined(separator: "\n")
+            lastError = ([lastError].compactMap { $0 } + errors).joined(separator: "\n")
         }
     }
 
@@ -109,15 +120,23 @@ final class IntegrationManager: ObservableObject {
         try RuntimePaths.prepareDirectories()
         guard let source = bundledBridgeURL() else { throw HookConfigurationError.missingBridgeBinary }
         let destination = RuntimePaths.installedBridgeURL
-        let staging = destination.deletingLastPathComponent().appendingPathComponent("wildlife-hook.installing")
-        try? FileManager.default.removeItem(at: staging)
-        try FileManager.default.copyItem(at: source, to: staging)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: staging.path)
-        if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
-        } else {
-            try FileManager.default.moveItem(at: staging, to: destination)
+        let bundledData = try Data(contentsOf: source)
+        if let installedData = try? SecureLocalFile.readPrivateFile(
+            at: destination,
+            mode: SecureLocalFile.executableFileMode
+        ),
+           installedData == bundledData {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: SecureLocalFile.executableFileMode)],
+                ofItemAtPath: destination.path
+            )
+            return
         }
+        try SecureLocalFile.writeAtomically(
+            bundledData,
+            to: destination,
+            mode: SecureLocalFile.executableFileMode
+        )
     }
 
     private func bundledBridgeURL() -> URL? {

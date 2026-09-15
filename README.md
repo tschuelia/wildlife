@@ -29,7 +29,7 @@ Run the dependency-free core behavior checks with:
 swift run WildlifeCoreChecks
 ```
 
-The check executable is used because the standalone Command Line Tools installation on the development machine does not ship XCTest or Swift Testing. It covers lifecycle reduction, configuration merging and repair, notch geometry, local history import, emoji allocation, and resume-command escaping.
+The check executable is used because the standalone Command Line Tools installation on the development machine does not ship XCTest or Swift Testing. It covers lifecycle and session isolation, metadata redaction, authenticated local transport, private persistence, configuration merging and repair, local history import, notch geometry, emoji allocation, and resume-command escaping.
 
 For normal development, open `Package.swift` in Xcode. The full Xcode app is required for archive, Developer ID distribution, and notarization.
 
@@ -61,11 +61,13 @@ If `WILDLIFE_NOTARY_PROFILE` names a Keychain profile created with `notarytool s
 
 Already-running agent processes need to be restarted or resumed because both CLIs load hook configuration when a session starts.
 
-On launch, Wildlife automatically repairs options on exact-match handlers it previously installed, including removing Codex's unsupported `async` option. It backs up the original configuration and never installs missing integrations or changes unrelated hooks during this migration. If Settings still shows **Repair needed** because events are missing, select **Install or Repair**.
+On launch, Wildlife refreshes its bridge binary and repairs options on exact-match handlers it previously installed, including removing `async` so Codex and Claude lifecycle events remain ordered. It backs up changed configuration and never installs missing integrations or changes unrelated hooks during this migration. If Settings still shows **Repair needed** because events are missing, select **Install or Repair**.
 
 ## Local data
 
 Wildlife stores its state under `~/Library/Application Support/Wildlife/`. Events use a user-private Unix socket and are spooled to a user-private inbox when the app is closed. Removing a Wildlife record never deletes the corresponding Codex or Claude transcript.
+
+See [SECURITY.md](SECURITY.md) for the complete local-data boundary, retained fields, and threat model.
 
 Default copied commands are:
 

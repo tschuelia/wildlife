@@ -8,6 +8,7 @@ struct ManagerView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var integrations: IntegrationManager
     @ObservedObject var runtime: AppRuntime
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
     @State private var showingOnboarding = false
 
@@ -38,7 +39,9 @@ struct ManagerView: View {
         }
         .frame(minWidth: 1_100, minHeight: 650)
         .onAppear {
-            runtime.start()
+            runtime.start {
+                openWindow(id: "manager")
+            }
             showingOnboarding = !settings.onboardingCompleted
         }
         .sheet(isPresented: $showingOnboarding) {
@@ -137,18 +140,21 @@ struct SessionBoard: View {
     @StateObject private var dragCoordinator = SessionDragCoordinator()
 
     var body: some View {
-        ScrollView(.horizontal) {
-            HStack(alignment: .top, spacing: 14) {
-                ForEach(WorkflowBucket.allCases) { bucket in
-                    SessionColumn(
-                        bucket: bucket,
-                        repository: repository,
-                        settings: settings,
-                        dragCoordinator: dragCoordinator
-                    )
+        GeometryReader { proxy in
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 14) {
+                    ForEach(WorkflowBucket.allCases) { bucket in
+                        SessionColumn(
+                            bucket: bucket,
+                            repository: repository,
+                            settings: settings,
+                            dragCoordinator: dragCoordinator
+                        )
+                    }
                 }
+                .frame(height: max(0, proxy.size.height - 32), alignment: .top)
+                .padding()
             }
-            .padding()
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -227,6 +233,7 @@ struct SessionColumn: View {
         }
         .padding(12)
         .frame(width: 300)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 14))
         .overlay {
             RoundedRectangle(cornerRadius: 14)

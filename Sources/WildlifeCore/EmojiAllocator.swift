@@ -29,8 +29,14 @@ public enum EmojiAllocator {
 
     public static func isSingleEmoji(_ candidate: String) -> Bool {
         guard candidate.count == 1, !candidate.isEmpty else { return false }
-        return candidate.unicodeScalars.contains {
-            $0.properties.isEmojiPresentation || $0.properties.isEmoji
+        let scalars = Array(candidate.unicodeScalars)
+        if scalars.contains(where: { $0.properties.isEmojiPresentation }) { return true }
+
+        let hasEmojiBase = scalars.contains {
+            $0.properties.isEmoji && $0.value != 0xFE0F && $0.value != 0x20E3
         }
+        let hasEmojiStyle = scalars.contains { $0.value == 0xFE0F }
+        let hasKeycap = scalars.contains { $0.value == 0x20E3 }
+        return hasEmojiBase && (hasEmojiStyle || hasKeycap)
     }
 }

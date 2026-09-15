@@ -24,6 +24,11 @@ final class NotchPanelController {
                 DispatchQueue.main.async { self?.refreshVisibility() }
             }
             .store(in: &cancellables)
+        presentation.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.refreshVisibility() }
+            }
+            .store(in: &cancellables)
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
             .sink { [weak self] _ in self?.refreshVisibility() }
             .store(in: &cancellables)
@@ -85,8 +90,13 @@ final class NotchPanelController {
         let count = min(repository.activeSessions.count, 8)
         let expandedHeight = geometry.notchSize.height
             + CGFloat(58 + count * 43 + (repository.activeSessions.count > 8 ? 24 : 0))
-        let frame = geometry.expandedFrame(width: Self.expandedWidth, height: expandedHeight)
-        presentation.updateGeometry(geometry, panelFrame: frame)
+        let expandedFrame = geometry.expandedFrame(width: Self.expandedWidth, height: expandedHeight)
+        presentation.updateGeometry(geometry, expandedFrame: expandedFrame)
+        let frame = geometry.panelFrame(
+            expanded: presentation.expanded,
+            expandedWidth: Self.expandedWidth,
+            expandedHeight: expandedHeight
+        )
         panel.setFrame(frame, display: true, animate: false)
     }
 
@@ -111,8 +121,6 @@ final class NotchPanelController {
     }
 }
 
-/// Limits the stable panel's interactive area to the currently visible island,
-/// allowing clicks in the surrounding transparent area to reach the app underneath.
 private final class NotchHostingView<Content: View>: NSHostingView<Content> {
     private weak var presentation: IslandPresentation?
     private var islandTrackingArea: NSTrackingArea?
@@ -149,11 +157,6 @@ private final class NotchHostingView<Content: View>: NSHostingView<Content> {
         presentation?.pointerExited()
     }
 
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        guard containsVisibleShape(point) else { return nil }
-        return super.hitTest(point)
-    }
-
     private var visibleIslandFrame: CGRect {
         guard let presentation else { return bounds }
         let size = CGSize(
@@ -163,49 +166,5 @@ private final class NotchHostingView<Content: View>: NSHostingView<Content> {
         let maximumX = max(bounds.minX, bounds.maxX - size.width)
         let x = min(max(bounds.minX + presentation.islandOriginX, bounds.minX), maximumX)
         return CGRect(x: x, y: bounds.maxY - size.height, width: size.width, height: size.height)
-    }
-
-    private func containsVisibleShape(_ point: NSPoint) -> Bool {
-        let frame = visibleIslandFrame
-        guard frame.contains(point) else { return false }
-        let localPoint = NSPoint(x: point.x - frame.minX, y: point.y - frame.minY)
-        let topRadius = min(6, frame.height / 2, frame.width / 2)
-        let bottomRadius = min(14, frame.height / 2, frame.width / 2)
-
-        if localPoint.x < bottomRadius, localPoint.y < bottomRadius {
-            return isInsideCorner(
-                localPoint,
-                center: NSPoint(x: bottomRadius, y: bottomRadius),
-                radius: bottomRadius
-            )
-        }
-        if localPoint.x > frame.width - bottomRadius, localPoint.y < bottomRadius {
-            return isInsideCorner(
-                localPoint,
-                center: NSPoint(x: frame.width - bottomRadius, y: bottomRadius),
-                radius: bottomRadius
-            )
-        }
-        if localPoint.x < topRadius, localPoint.y > frame.height - topRadius {
-            return isInsideCorner(
-                localPoint,
-                center: NSPoint(x: topRadius, y: frame.height - topRadius),
-                radius: topRadius
-            )
-        }
-        if localPoint.x > frame.width - topRadius, localPoint.y > frame.height - topRadius {
-            return isInsideCorner(
-                localPoint,
-                center: NSPoint(x: frame.width - topRadius, y: frame.height - topRadius),
-                radius: topRadius
-            )
-        }
-        return true
-    }
-
-    private func isInsideCorner(_ point: NSPoint, center: NSPoint, radius: CGFloat) -> Bool {
-        let dx = point.x - center.x
-        let dy = point.y - center.y
-        return dx * dx + dy * dy <= radius * radius
     }
 }

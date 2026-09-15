@@ -70,7 +70,6 @@ final class IslandPresentation: ObservableObject {
     @Published private(set) var notchSize = CGSize(width: 185, height: 32)
     @Published private(set) var compactSize = CGSize(width: 245, height: 32)
     @Published private(set) var expandedSize = CGSize(width: 310, height: 32)
-    @Published private(set) var compactOriginX: CGFloat = 32.5
     @Published private(set) var compactLeftWingWidth: CGFloat = 30
     @Published private(set) var compactRightWingWidth: CGFloat = 30
     @Published private(set) var expandedLeftWingWidth: CGFloat = 62.5
@@ -79,22 +78,19 @@ final class IslandPresentation: ObservableObject {
     private var collapseTask: Task<Void, Never>?
 
     var islandSize: CGSize { expanded ? expandedSize : compactSize }
-    var islandOriginX: CGFloat { expanded ? 0 : compactOriginX }
+    var islandOriginX: CGFloat { 0 }
     var leftWingWidth: CGFloat { expanded ? expandedLeftWingWidth : compactLeftWingWidth }
     var rightWingWidth: CGFloat { expanded ? expandedRightWingWidth : compactRightWingWidth }
 
-    func updateGeometry(_ geometry: NotchGeometry, panelFrame: CGRect) {
+    func updateGeometry(_ geometry: NotchGeometry, expandedFrame: CGRect) {
         if notchSize != geometry.notchSize { notchSize = geometry.notchSize }
         if compactSize != geometry.compactFrame.size { compactSize = geometry.compactFrame.size }
-        if expandedSize != panelFrame.size { expandedSize = panelFrame.size }
-
-        let newCompactOriginX = geometry.compactFrame.minX - panelFrame.minX
-        if compactOriginX != newCompactOriginX { compactOriginX = newCompactOriginX }
+        if expandedSize != expandedFrame.size { expandedSize = expandedFrame.size }
         if compactLeftWingWidth != geometry.leftWingWidth { compactLeftWingWidth = geometry.leftWingWidth }
         if compactRightWingWidth != geometry.rightWingWidth { compactRightWingWidth = geometry.rightWingWidth }
 
-        let newExpandedLeftWingWidth = geometry.notchFrame.minX - panelFrame.minX
-        let newExpandedRightWingWidth = panelFrame.maxX - geometry.notchFrame.maxX
+        let newExpandedLeftWingWidth = geometry.notchFrame.minX - expandedFrame.minX
+        let newExpandedRightWingWidth = expandedFrame.maxX - geometry.notchFrame.maxX
         if expandedLeftWingWidth != newExpandedLeftWingWidth {
             expandedLeftWingWidth = newExpandedLeftWingWidth
         }

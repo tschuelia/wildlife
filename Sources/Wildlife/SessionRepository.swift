@@ -6,6 +6,7 @@ import WildlifeCore
 @MainActor
 final class SessionRepository: ObservableObject {
     private let diskStore: SessionDiskStore
+    private var deletedSessionKeys: Set<String> = []
     @Published private(set) var sessions: [SessionRecord] = []
     @Published var selectedSessionKey: String?
     @Published var searchText = ""
@@ -18,7 +19,9 @@ final class SessionRepository: ObservableObject {
             let url = RuntimePaths.applicationSupportDirectory.appendingPathComponent("Sessions.json")
             diskStore = SessionDiskStore(url: url)
         }
-        sessions = try diskStore.load()
+        let state = try diskStore.loadState()
+        sessions = state.sessions
+        deletedSessionKeys = Set(state.deletedSessionKeys)
     }
 
     var selectedSession: SessionRecord? {
@@ -60,8 +63,9 @@ final class SessionRepository: ObservableObject {
     }
 
     func consume(_ event: BridgeEvent) {
-        defer { removeSpoolFile(eventID: event.eventID) }
-        let key = "\(event.provider.rawValue):\(event.sessionID)"
+        guard event.isValidForTransport else { return }
+        let key = event.stableKey
+        let restoresDeletedSession = deletedSessionKeys.contains(key)
         let session: SessionRecord
         if let existing = sessions.first(where: { $0.stableKey == key }) {
             session = existing
@@ -81,16 +85,18 @@ final class SessionRepository: ObservableObject {
             sessions.append(session)
         }
         guard SessionEventReducer.apply(event, to: session) else { return }
+        if restoresDeletedSession {
+            deletedSessionKeys.remove(key)
+        }
         persist()
         objectWillChange.send()
     }
 
     func importSessions(_ imported: [ImportedSession]) -> Int {
         var count = 0
-        var keys = Set(sessions.map(\.stableKey))
         var usedEmoji = Set(sessions.map(\.emoji))
         var metadataChanged = false
-        for item in imported {
+        for item in imported where !deletedSessionKeys.contains(item.stableKey) {
             if let existing = sessions.first(where: { $0.stableKey == item.stableKey }) {
                 if existing.sourceTitle.isEmpty && !item.title.isEmpty {
                     existing.sourceTitle = item.title
@@ -113,7 +119,6 @@ final class SessionRepository: ObservableObject {
             )
             record.endedAt = item.updatedAt
             sessions.append(record)
-            keys.insert(item.stableKey)
             count += 1
         }
         if count > 0 || metadataChanged {
@@ -216,6 +221,7 @@ final class SessionRepository: ObservableObject {
 
     func delete(_ session: SessionRecord) {
         if selectedSessionKey == session.stableKey { selectedSessionKey = nil }
+        deletedSessionKeys.insert(session.stableKey)
         sessions.removeAll { $0.stableKey == session.stableKey }
         persist()
     }
@@ -265,11 +271,9 @@ final class SessionRepository: ObservableObject {
     }
 
     private func persist() {
-        try? diskStore.save(sessions)
-    }
-
-    private func removeSpoolFile(eventID: String) {
-        let url = RuntimePaths.inboxDirectory.appendingPathComponent("\(eventID).json")
-        try? FileManager.default.removeItem(at: url)
+        try? diskStore.save(PersistedSessions(
+            sessions: sessions,
+            deletedSessionKeys: deletedSessionKeys.sorted()
+        ))
     }
 }

@@ -61,4 +61,14 @@ public struct NotchGeometry: Equatable, Sendable {
         let x = min(max(idealX, screenFrame.minX), screenFrame.maxX - width)
         return CGRect(x: x, y: screenFrame.maxY - height, width: width, height: height)
     }
+
+    public func panelFrame(
+        expanded: Bool,
+        expandedWidth: CGFloat,
+        expandedHeight: CGFloat
+    ) -> CGRect {
+        expanded
+            ? expandedFrame(width: expandedWidth, height: expandedHeight)
+            : compactFrame
+    }
 }

@@ -34,7 +34,6 @@ public struct HistoricalImporter: Sendable {
                     WHEN updated_at_ms > 0 THEN updated_at_ms ELSE updated_at * 1000 END
         FROM threads
         WHERE source = 'cli'
-          AND has_user_event = 1
           AND (thread_source IS NULL OR thread_source = '' OR thread_source = 'user')
           AND (CASE WHEN recency_at_ms > 0 THEN recency_at_ms
                     WHEN updated_at_ms > 0 THEN updated_at_ms ELSE updated_at * 1000 END) >= ?

@@ -68,7 +68,7 @@ public enum HookConfiguration {
 
         for event in events {
             var groups = hooks[event] as? [[String: Any]] ?? []
-            let desired = desiredHandler(provider: provider, event: event, command: command)
+            let desired = desiredHandler(event: event, command: command)
             var found = false
 
             for groupIndex in groups.indices {
@@ -131,7 +131,7 @@ public enum HookConfiguration {
 
         for event in events {
             guard var groups = hooks[event] as? [[String: Any]] else { continue }
-            let desired = desiredHandler(provider: provider, event: event, command: command)
+            let desired = desiredHandler(event: event, command: command)
 
             for groupIndex in groups.indices {
                 guard var handlers = groups[groupIndex]["hooks"] as? [[String: Any]] else { continue }
@@ -220,7 +220,7 @@ public enum HookConfiguration {
         let required = provider == .codex ? codexEvents : claudeEvents
         let installed = required.allSatisfy { event in
             guard let groups = hooks[event] as? [[String: Any]] else { return false }
-            let desired = desiredHandler(provider: provider, event: event, command: command)
+            let desired = desiredHandler(event: event, command: command)
             return groups.contains { group in
                 guard let handlers = group["hooks"] as? [[String: Any]] else { return false }
                 return handlers.contains {
@@ -249,22 +249,14 @@ public enum HookConfiguration {
     }
 
     private static func desiredHandler(
-        provider: AgentProvider,
         event: String,
         command: String
     ) -> [String: Any] {
-        var handler: [String: Any] = [
+        [
             "type": "command",
             "command": command,
             "timeout": event == "SessionEnd" ? 3 : 2,
         ]
-        // The installed Codex runtime warns and skips command hooks carrying
-        // `async`. Claude supports it, so retain asynchronous delivery there
-        // except at shutdown.
-        if provider == .claude && event != "SessionEnd" {
-            handler["async"] = true
-        }
-        return handler
     }
 
     private static func reconcile(existing: [String: Any], with desired: [String: Any]) -> [String: Any] {
@@ -304,19 +296,12 @@ public enum HookConfiguration {
         let backup = configURL
             .deletingLastPathComponent()
             .appendingPathComponent("\(configURL.lastPathComponent).wildlife-backup-\(formatter.string(from: now))")
-        try data.write(to: backup, options: [.atomic])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+        try SecureLocalFile.writeAtomically(data, to: backup)
         return backup
     }
 
     private static func write(_ root: [String: Any], to url: URL) throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        try data.write(to: url, options: [.atomic])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try SecureLocalFile.writeAtomically(data, to: url)
     }
 }
