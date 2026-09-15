@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import WildlifeDomain
 
 package enum LocalEventTransport {
     package static let maximumPayloadSize = 65_536
@@ -64,15 +65,17 @@ package enum LocalEventTransport {
 
 package final class LocalEventServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "app.wildlife.event-server", qos: .userInitiated)
+    private let descriptorLock = NSLock()
     private var descriptor: Int32 = -1
+    private var generation: UInt = 0
     private let socketURL: URL
 
     package init(socketURL: URL = RuntimePaths.socketURL) {
         self.socketURL = socketURL
     }
 
-    package func start(handler: @escaping @Sendable (BridgeEvent) -> Void) throws {
-        if descriptor >= 0 { return }
+    package func start(handler: @escaping @Sendable (AgentEvent) -> Void) throws {
+        if currentDescriptor() >= 0 { return }
         try SecureLocalFile.removeOwnedSocket(at: socketURL)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw POSIXError(.EIO) }
@@ -96,30 +99,39 @@ package final class LocalEventServer: @unchecked Sendable {
             try? SecureLocalFile.removeOwnedSocket(at: socketURL)
             throw POSIXError(error)
         }
-        descriptor = fd
+        let generation = installDescriptor(fd)
 
         queue.async { [weak self] in
-            self?.acceptLoop(handler: handler)
+            self?.acceptLoop(descriptor: fd, generation: generation, handler: handler)
         }
     }
 
     package func stop() {
-        let fd = descriptor
-        descriptor = -1
-        if fd >= 0 { close(fd) }
+        let fd = takeDescriptor()
+        if fd >= 0 {
+            shutdown(fd, SHUT_RDWR)
+            close(fd)
+        }
         try? SecureLocalFile.removeOwnedSocket(at: socketURL)
     }
 
-    private func acceptLoop(handler: @escaping @Sendable (BridgeEvent) -> Void) {
-        while descriptor >= 0 {
-            let client = accept(descriptor, nil, nil)
-            if client < 0 { continue }
+    private func acceptLoop(
+        descriptor server: Int32,
+        generation: UInt,
+        handler: @escaping @Sendable (AgentEvent) -> Void
+    ) {
+        while isCurrent(server, generation: generation) {
+            let client = accept(server, nil, nil)
+            if client < 0 {
+                if !isCurrent(server, generation: generation) { return }
+                continue
+            }
             defer { close(client) }
             guard LocalEventTransport.peerBelongsToCurrentUser(client) else { continue }
             configureReceiveTimeout(client)
             guard let data = readAll(client),
-                  let event = try? JSONDecoder().decode(BridgeEvent.self, from: data),
-                  event.isValidForTransport else { continue }
+                  let event = try? JSONDecoder().decode(AgentEvent.self, from: data),
+                  event.isValid else { continue }
             handler(event)
         }
     }
@@ -150,6 +162,35 @@ package final class LocalEventServer: @unchecked Sendable {
     }
 
     deinit { stop() }
+
+    private func currentDescriptor() -> Int32 {
+        descriptorLock.lock()
+        defer { descriptorLock.unlock() }
+        return descriptor
+    }
+
+    private func installDescriptor(_ value: Int32) -> UInt {
+        descriptorLock.lock()
+        defer { descriptorLock.unlock() }
+        generation &+= 1
+        descriptor = value
+        return generation
+    }
+
+    private func isCurrent(_ value: Int32, generation expectedGeneration: UInt) -> Bool {
+        descriptorLock.lock()
+        defer { descriptorLock.unlock() }
+        return descriptor == value && generation == expectedGeneration
+    }
+
+    private func takeDescriptor() -> Int32 {
+        descriptorLock.lock()
+        defer { descriptorLock.unlock() }
+        let value = descriptor
+        descriptor = -1
+        generation &+= 1
+        return value
+    }
 
     private func currentPOSIXError() -> POSIXErrorCode {
         POSIXErrorCode(rawValue: errno) ?? .EIO

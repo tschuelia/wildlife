@@ -68,6 +68,7 @@ package enum SecureLocalFile {
             if descriptorIsOpen { close(descriptor) }
             unlink(staging.path)
         }
+        guard fchmod(descriptor, mode) == 0 else { throw POSIXError(currentPOSIXError()) }
 
         try data.withUnsafeBytes { bytes in
             guard let base = bytes.baseAddress else { return }
@@ -92,6 +93,33 @@ package enum SecureLocalFile {
         maximumSize: Int? = nil,
         mode: mode_t = privateFileMode
     ) throws -> Data {
+        try readRegularFile(
+            at: url,
+            maximumSize: maximumSize,
+            requiredMode: mode,
+            repairMismatchedMode: true
+        )
+    }
+
+    package static func readOwnedRegularFile(
+        at url: URL,
+        maximumSize: Int? = nil,
+        requiredMode: mode_t? = nil
+    ) throws -> Data {
+        try readRegularFile(
+            at: url,
+            maximumSize: maximumSize,
+            requiredMode: requiredMode,
+            repairMismatchedMode: false
+        )
+    }
+
+    private static func readRegularFile(
+        at url: URL,
+        maximumSize: Int?,
+        requiredMode: mode_t?,
+        repairMismatchedMode: Bool
+    ) throws -> Data {
         let info = try fileInfo(at: url)
         guard info.st_uid == geteuid() else {
             throw LocalSecurityError.unsafePath(url, "file is owned by another user")
@@ -102,8 +130,11 @@ package enum SecureLocalFile {
         if let maximumSize, info.st_size > maximumSize {
             throw LocalSecurityError.unsafePath(url, "file exceeds the size limit")
         }
-        if info.st_mode & 0o777 != mode, chmod(url.path, mode) != 0 {
-            throw POSIXError(currentPOSIXError())
+        if let requiredMode, info.st_mode & 0o777 != requiredMode {
+            guard repairMismatchedMode else {
+                throw LocalSecurityError.unsafePath(url, "expected permissions \(String(requiredMode, radix: 8))")
+            }
+            guard chmod(url.path, requiredMode) == 0 else { throw POSIXError(currentPOSIXError()) }
         }
         return try Data(contentsOf: url, options: [.mappedIfSafe])
     }

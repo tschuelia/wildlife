@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
-import WildlifeCore
+import WildlifeDomain
+import WildlifeInfrastructure
 
 enum TerminalFocusResult: Equatable {
     case exactSession
@@ -32,23 +33,23 @@ final class TerminalSessionFocus {
         static let terminal = "com.apple.Terminal"
     }
 
-    func focus(_ session: SessionRecord) -> TerminalFocusResult {
-        guard let processID = session.processID,
-              ProcessInspector.isAlive(pid: processID, startIdentity: session.processStartIdentity) else {
+    func focus(_ session: Session) -> TerminalFocusResult {
+        guard let process = session.process,
+              ProcessInspector.isAlive(pid: process.pid, startIdentity: process.startIdentity) else {
             return .unavailable(.processUnavailable)
         }
-        guard let application = owningApplication(startingAt: processID) else {
+        guard let application = owningApplication(startingAt: process.pid) else {
             return .unavailable(.owningApplicationUnavailable)
         }
 
         prepareToActivate(application)
         switch application.bundleIdentifier {
         case BundleIdentifier.iTerm:
-            if let tty = validatedTTY(session.tty), focusITerm(tty: tty) {
+            if let tty = validatedTTY(process.tty), focusITerm(tty: tty) {
                 return .exactSession
             }
         case BundleIdentifier.terminal:
-            if let tty = validatedTTY(session.tty), focusTerminal(tty: tty) {
+            if let tty = validatedTTY(process.tty), focusTerminal(tty: tty) {
                 return .exactSession
             }
         default:

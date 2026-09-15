@@ -1,5 +1,6 @@
 import Foundation
-import WildlifeCore
+import WildlifeDomain
+import WildlifeInfrastructure
 
 private func spool(_ data: Data, eventID: String) {
     do {
@@ -22,14 +23,14 @@ private func run() {
     }
 
     let process = ProcessInspector.captureAgentProcess(provider: provider)
-    guard let event = try? BridgeEventFactory.decodeHookInput(
+    guard let event = try? AgentEventFactory.decodeHookInput(
         inputData,
         provider: provider,
         fallbackCWD: FileManager.default.currentDirectoryPath,
         process: process
     ), let encoded = try? JSONEncoder().encode(event) else { return }
 
-    spool(encoded, eventID: event.eventID)
+    spool(encoded, eventID: event.id)
     LocalEventTransport.send(encoded)
 }
 

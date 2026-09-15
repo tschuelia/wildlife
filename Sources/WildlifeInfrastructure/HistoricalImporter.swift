@@ -1,10 +1,50 @@
 import CSQLite
 import Foundation
+import WildlifeDomain
 
-public struct HistoricalImporter: Sendable {
-    public init() {}
+private struct ClaudeSessionIndex: Decodable {
+    let originalPath: String?
+    let entries: [ClaudeSessionEntry]
+}
 
-    public func importSessions(
+private struct ClaudeSessionEntry: Decodable {
+    let sessionID: String
+    let isSidechain: Bool?
+    let summary: String?
+    let projectPath: String?
+    let created: FlexibleTimestamp?
+    let modified: FlexibleTimestamp?
+    let fileMtime: FlexibleTimestamp?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case isSidechain, summary, projectPath, created, modified, fileMtime
+    }
+}
+
+private struct FlexibleTimestamp: Decodable {
+    let date: Date
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let number = try? container.decode(Double.self) {
+            date = Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1_000 : number)
+            return
+        }
+        let string = try container.decode(String.self)
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let parsed = fractional.date(from: string) ?? ISO8601DateFormatter().date(from: string) else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unsupported timestamp")
+        }
+        date = parsed
+    }
+}
+
+package struct HistoricalImporter: Sendable {
+    package init() {}
+
+    package func importSessions(
         codexHome: URL,
         claudeHome: URL,
         since cutoff: Date
@@ -13,13 +53,13 @@ public struct HistoricalImporter: Sendable {
         let claude = importClaude(projectsURL: claudeHome.appendingPathComponent("projects"), since: cutoff)
         var unique: [String: ImportedSession] = [:]
         for session in codex + claude {
-            if let existing = unique[session.stableKey], existing.updatedAt >= session.updatedAt { continue }
-            unique[session.stableKey] = session
+            if let existing = unique[session.id.description], existing.updatedAt >= session.updatedAt { continue }
+            unique[session.id.description] = session
         }
         return unique.values.sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    public func importCodex(databaseURL: URL, since cutoff: Date) -> [ImportedSession] {
+    package func importCodex(databaseURL: URL, since cutoff: Date) -> [ImportedSession] {
         guard FileManager.default.fileExists(atPath: databaseURL.path) else { return [] }
         var database: OpaquePointer?
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
@@ -63,7 +103,7 @@ public struct HistoricalImporter: Sendable {
         return result
     }
 
-    public func importClaude(projectsURL: URL, since cutoff: Date) -> [ImportedSession] {
+    package func importClaude(projectsURL: URL, since cutoff: Date) -> [ImportedSession] {
         guard let projectURLs = try? FileManager.default.contentsOfDirectory(
             at: projectsURL,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -75,24 +115,18 @@ public struct HistoricalImporter: Sendable {
             guard (try? projectURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
             let indexURL = projectURL.appendingPathComponent("sessions-index.json")
             guard let data = try? Data(contentsOf: indexURL),
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let entries = root["entries"] as? [[String: Any]] else { continue }
+                  let index = try? JSONDecoder().decode(ClaudeSessionIndex.self, from: data) else { continue }
 
-            for entry in entries {
-                guard (entry["isSidechain"] as? Bool) != true,
-                      let id = entry["sessionId"] as? String,
-                      !id.isEmpty else { continue }
-                let updated = parseDate(entry["modified"] ?? entry["fileMtime"])
-                guard let updated, updated >= cutoff else { continue }
-                let created = parseDate(entry["created"]) ?? updated
-                let title = entry["summary"] as? String ?? ""
-                let cwd = entry["projectPath"] as? String ?? root["originalPath"] as? String ?? ""
+            for entry in index.entries {
+                guard entry.isSidechain != true, !entry.sessionID.isEmpty,
+                      let updated = (entry.modified ?? entry.fileMtime)?.date,
+                      updated >= cutoff else { continue }
                 result.append(ImportedSession(
                     provider: .claude,
-                    sessionID: id,
-                    title: title,
-                    cwd: cwd,
-                    createdAt: created,
+                    sessionID: entry.sessionID,
+                    title: entry.summary ?? "",
+                    cwd: entry.projectPath ?? index.originalPath ?? "",
+                    createdAt: entry.created?.date ?? updated,
                     updatedAt: updated
                 ))
             }
@@ -105,16 +139,4 @@ public struct HistoricalImporter: Sendable {
         return String(cString: value)
     }
 
-    private func parseDate(_ value: Any?) -> Date? {
-        if let seconds = value as? Double {
-            return Date(timeIntervalSince1970: seconds > 10_000_000_000 ? seconds / 1_000 : seconds)
-        }
-        if let seconds = value as? Int {
-            return Date(timeIntervalSince1970: seconds > 10_000_000_000 ? Double(seconds) / 1_000 : Double(seconds))
-        }
-        guard let string = value as? String else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: string) ?? ISO8601DateFormatter().date(from: string)
-    }
 }

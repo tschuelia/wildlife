@@ -1,7 +1,6 @@
-import AppKit
 import Foundation
+import WildlifeDomain
 @preconcurrency import UserNotifications
-import WildlifeCore
 
 enum WildlifeNotificationAction: Sendable {
     case open
@@ -12,39 +11,33 @@ enum WildlifeNotificationAction: Sendable {
 @MainActor
 final class AttentionNotificationController: NSObject, UNUserNotificationCenterDelegate {
     private enum Identifier {
-        static let attentionCategory = "WILDLIFE_ATTENTION"
-        static let completionCategory = "WILDLIFE_COMPLETION"
+        static let attention = "WILDLIFE_ATTENTION"
+        static let completion = "WILDLIFE_COMPLETION"
         static let focus = "WILDLIFE_FOCUS"
         static let snooze = "WILDLIFE_SNOOZE"
-        static let sessionKey = "sessionKey"
+        static let sessionID = "sessionID"
     }
 
     private let center = UNUserNotificationCenter.current()
-    private var actionHandler: (@MainActor @Sendable (WildlifeNotificationAction, String) -> Void)?
+    private var actionHandler: (@MainActor @Sendable (WildlifeNotificationAction, SessionID) -> Void)?
 
     override init() {
         super.init()
         center.delegate = self
         center.setNotificationCategories([
             UNNotificationCategory(
-                identifier: Identifier.attentionCategory,
+                identifier: Identifier.attention,
                 actions: [
                     UNNotificationAction(identifier: Identifier.focus, title: "Focus Terminal"),
                     UNNotificationAction(identifier: Identifier.snooze, title: "Snooze 1 Hour"),
                 ],
                 intentIdentifiers: []
             ),
-            UNNotificationCategory(
-                identifier: Identifier.completionCategory,
-                actions: [],
-                intentIdentifiers: []
-            ),
+            UNNotificationCategory(identifier: Identifier.completion, actions: [], intentIdentifiers: []),
         ])
     }
 
-    func configure(
-        actionHandler: @escaping @MainActor @Sendable (WildlifeNotificationAction, String) -> Void
-    ) {
+    func configure(actionHandler: @escaping @MainActor @Sendable (WildlifeNotificationAction, SessionID) -> Void) {
         self.actionHandler = actionHandler
     }
 
@@ -54,46 +47,45 @@ final class AttentionNotificationController: NSObject, UNUserNotificationCenterD
 
     func notify(
         transition: SessionTransition,
-        session: SessionRecord,
-        settings: AppSettings
+        session: Session,
+        preferences: NotificationPreferences
     ) {
-        guard settings.notificationsEnabled,
+        guard preferences.enabled,
               let kind = SessionNotificationDecision.kind(for: transition),
-              isEnabled(kind, settings: settings) else { return }
-
-        if session.attentionReason() == nil {
-            cancelSnooze(for: session.stableKey)
-        }
+              isEnabled(kind, preferences: preferences) else { return }
         let content = content(for: kind, session: session)
-        let request = UNNotificationRequest(
-            identifier: "wildlife-live-\(kind.rawValue)-\(session.stableKey)",
+        center.add(UNNotificationRequest(
+            identifier: "wildlife-live-\(kind.rawValue)-\(session.id)",
             content: content,
             trigger: nil
-        )
-        center.add(request)
+        ))
     }
 
-    func scheduleSnooze(for session: SessionRecord, until date: Date) {
+    func scheduleSnooze(for session: Session, until date: Date) {
         guard let reason = session.unsnoozedAttentionReason else { return }
-        cancelSnooze(for: session.stableKey)
+        cancelSnooze(for: session.id)
         let content = UNMutableNotificationContent()
         content.title = session.displayTitle
         content.body = reason.displayName
         content.sound = .default
-        content.categoryIdentifier = Identifier.attentionCategory
-        content.userInfo = [Identifier.sessionKey: session.stableKey]
-        let interval = max(1, date.timeIntervalSinceNow)
+        content.categoryIdentifier = Identifier.attention
+        content.userInfo = [Identifier.sessionID: session.id.description]
         center.add(UNNotificationRequest(
-            identifier: snoozeIdentifier(session.stableKey),
+            identifier: snoozeIdentifier(session.id),
             content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: max(1, date.timeIntervalSinceNow), repeats: false)
         ))
     }
 
-    func cancelSnooze(for sessionKey: String) {
-        let identifier = snoozeIdentifier(sessionKey)
-        center.removePendingNotificationRequests(withIdentifiers: [identifier])
-        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+    func cancelSnooze(for sessionID: SessionID) {
+        let id = snoozeIdentifier(sessionID)
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+        center.removeDeliveredNotifications(withIdentifiers: [id])
+    }
+
+    func cancelAllSnoozes() {
+        center.removeAllPendingNotificationRequests()
+        center.removeAllDeliveredNotifications()
     }
 
     nonisolated func userNotificationCenter(
@@ -109,31 +101,28 @@ final class AttentionNotificationController: NSObject, UNUserNotificationCenterD
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let key = response.notification.request.content.userInfo[Identifier.sessionKey] as? String
-        let action: WildlifeNotificationAction
-        switch response.actionIdentifier {
-        case Identifier.focus: action = .focus
-        case Identifier.snooze: action = .snooze
-        default: action = .open
+        let key = response.notification.request.content.userInfo[Identifier.sessionID] as? String
+        let action: WildlifeNotificationAction = switch response.actionIdentifier {
+        case Identifier.focus: .focus
+        case Identifier.snooze: .snooze
+        default: .open
         }
-        if let key {
-            Task { @MainActor [weak self] in
-                self?.actionHandler?(action, key)
-            }
+        if let key, let id = SessionID(key: key) {
+            Task { @MainActor [weak self] in self?.actionHandler?(action, id) }
         }
         completionHandler()
     }
 
-    private func isEnabled(_ kind: SessionNotificationKind, settings: AppSettings) -> Bool {
+    private func isEnabled(_ kind: SessionNotificationKind, preferences: NotificationPreferences) -> Bool {
         switch kind {
-        case .approval: settings.notificationApproval
-        case .input: settings.notificationInput
-        case .failure: settings.notificationFailure
-        case .completion: settings.notificationCompletion
+        case .approval: preferences.approvals
+        case .input: preferences.input
+        case .failure: preferences.failures
+        case .completion: preferences.completions
         }
     }
 
-    private func content(for kind: SessionNotificationKind, session: SessionRecord) -> UNMutableNotificationContent {
+    private func content(for kind: SessionNotificationKind, session: Session) -> UNMutableNotificationContent {
         let content = UNMutableNotificationContent()
         content.title = session.displayTitle
         content.body = switch kind {
@@ -143,14 +132,10 @@ final class AttentionNotificationController: NSObject, UNUserNotificationCenterD
         case .completion: "Session completed"
         }
         content.sound = kind == .completion ? nil : .default
-        content.categoryIdentifier = kind == .completion
-            ? Identifier.completionCategory
-            : Identifier.attentionCategory
-        content.userInfo = [Identifier.sessionKey: session.stableKey]
+        content.categoryIdentifier = kind == .completion ? Identifier.completion : Identifier.attention
+        content.userInfo = [Identifier.sessionID: session.id.description]
         return content
     }
 
-    private func snoozeIdentifier(_ key: String) -> String {
-        "wildlife-snooze-\(key)"
-    }
+    private func snoozeIdentifier(_ id: SessionID) -> String { "wildlife-snooze-\(id)" }
 }

@@ -8,18 +8,17 @@ let package = Package(
     products: [
         .executable(name: "Wildlife", targets: ["Wildlife"]),
         .executable(name: "wildlife-hook", targets: ["WildlifeHook"]),
-        .executable(name: "WildlifeCoreChecks", targets: ["WildlifeCoreChecks"]),
-        .library(name: "WildlifeCore", targets: ["WildlifeCore"]),
     ],
     targets: [
         .systemLibrary(name: "CSQLite"),
-        .target(name: "WildlifeCore", dependencies: ["CSQLite"]),
-        .executableTarget(name: "Wildlife", dependencies: ["WildlifeCore"]),
-        .executableTarget(name: "WildlifeHook", dependencies: ["WildlifeCore"]),
-        .executableTarget(
-            name: "WildlifeCoreChecks",
-            dependencies: ["WildlifeCore", "CSQLite"],
-            path: "Checks/WildlifeCoreChecks"
+        .target(name: "WildlifeDomain"),
+        .target(
+            name: "WildlifeInfrastructure",
+            dependencies: ["WildlifeDomain", "CSQLite"]
         ),
+        .executableTarget(name: "Wildlife", dependencies: ["WildlifeDomain", "WildlifeInfrastructure"]),
+        .executableTarget(name: "WildlifeHook", dependencies: ["WildlifeDomain", "WildlifeInfrastructure"]),
+        .testTarget(name: "WildlifeDomainTests", dependencies: ["WildlifeDomain"]),
+        .testTarget(name: "WildlifeInfrastructureTests", dependencies: ["WildlifeDomain", "WildlifeInfrastructure", "CSQLite"]),
     ]
 )

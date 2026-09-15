@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "${0:A:h}/.."
 
+if [[ -z "${DEVELOPER_DIR:-}" && -d "/Applications/Xcode.app/Contents/Developer" ]]; then
+  export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+fi
+
 WILDLIFE_CONFIGURATION="${WILDLIFE_CONFIGURATION:-release}"
 WILDLIFE_CODESIGN_IDENTITY="${WILDLIFE_CODESIGN_IDENTITY:--}"
 WILDLIFE_APP_DIR=".build/Wildlife.app"

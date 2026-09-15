@@ -1,23 +1,24 @@
 import AppKit
+import Observation
 import SwiftUI
-import WildlifeCore
+import WildlifeDomain
+import WildlifeInfrastructure
 
 struct QuickView: View {
-    @EnvironmentObject private var actions: SessionActionController
-    @ObservedObject var repository: SessionRepository
-    @ObservedObject var settings: AppSettings
-    let openManager: (String?) -> Void
+    let library: SessionLibrary
+    let actions: SessionActionController
+    let openManager: (SessionID?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label("Wildlife", systemImage: "pawprint.fill").font(.headline)
                 Spacer()
-                Text("\(repository.activeSessions.count) active")
+                Text("\(library.activeSessions.count) active")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            if repository.activeSessions.isEmpty {
+            if library.activeSessions.isEmpty {
                 ContentUnavailableView(
                     "No active sessions",
                     systemImage: "leaf",
@@ -25,50 +26,29 @@ struct QuickView: View {
                 )
                 .frame(height: 120)
             } else {
-                ForEach(repository.activeSessions, id: \.stableKey) { session in
+                ForEach(library.activeSessions.prefix(8)) { session in
                     HStack(spacing: 9) {
-                        Text(session.emoji).font(.title2)
+                        Text(session.emoji.value).font(.title2)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(session.displayTitle).font(.callout.bold()).lineLimit(1)
-                            Text(session.runtimeStatus.displayName)
+                            Text(session.activeStatus?.displayName ?? "Ended")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        StatusDot(status: session.runtimeStatus)
-                        Button {
-                            _ = actions.focus(session)
-                        } label: { Image(systemName: "scope") }
+                        StatusIndicator(status: session.activeStatus)
+                        Button { _ = actions.focus(session) } label: { Image(systemName: "scope") }
                             .buttonStyle(.borderless)
                             .help("Focus terminal session")
-                        Button {
-                            do {
-                                try repository.copyResumeCommand(session, settings: settings)
-                                actions.message = "Command copied"
-                            } catch {
-                                actions.message = error.localizedDescription
-                            }
-                        } label: { Image(systemName: "doc.on.doc") }
-                            .buttonStyle(.borderless)
-                            .help("Copy resume command")
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture { openManager(session.stableKey) }
+                    .onTapGesture { openManager(session.id) }
                 }
             }
             Divider()
             HStack {
                 Button("Open Wildlife") { openManager(nil) }
                 Spacer()
-                if let message = actions.message {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .task(id: message) {
-                            try? await Task.sleep(for: .seconds(3))
-                            if actions.message == message { actions.message = nil }
-                        }
-                }
                 Button("Quit Wildlife") { NSApplication.shared.terminate(nil) }
             }
         }
@@ -78,288 +58,160 @@ struct QuickView: View {
 }
 
 @MainActor
-final class IslandPresentation: ObservableObject {
-    static let collapseDelay: Duration = .milliseconds(200)
-
-    @Published private(set) var expanded = false
-    @Published private(set) var notchSize = CGSize(width: 185, height: 32)
-    @Published private(set) var compactSize = CGSize(width: 245, height: 32)
-    @Published private(set) var expandedSize = CGSize(width: 310, height: 32)
-    @Published private(set) var compactLeftWingWidth: CGFloat = 30
-    @Published private(set) var compactRightWingWidth: CGFloat = 30
-    @Published private(set) var expandedLeftWingWidth: CGFloat = 62.5
-    @Published private(set) var expandedRightWingWidth: CGFloat = 62.5
-
+@Observable
+final class IslandPresentation {
+    private(set) var expanded = false
+    private(set) var notchSize = CGSize(width: 185, height: 32)
+    private(set) var compactSize = CGSize(width: 245, height: 32)
+    private(set) var expandedSize = CGSize(width: 310, height: 32)
+    private(set) var compactLeftWingWidth: CGFloat = 30
+    private(set) var compactRightWingWidth: CGFloat = 30
+    private(set) var expandedLeftWingWidth: CGFloat = 62.5
+    private(set) var expandedRightWingWidth: CGFloat = 62.5
     private var collapseTask: Task<Void, Never>?
 
     var islandSize: CGSize { expanded ? expandedSize : compactSize }
-    var islandOriginX: CGFloat { 0 }
     var leftWingWidth: CGFloat { expanded ? expandedLeftWingWidth : compactLeftWingWidth }
     var rightWingWidth: CGFloat { expanded ? expandedRightWingWidth : compactRightWingWidth }
 
     func updateGeometry(_ geometry: NotchGeometry, expandedFrame: CGRect) {
-        if notchSize != geometry.notchSize { notchSize = geometry.notchSize }
-        if compactSize != geometry.compactFrame.size { compactSize = geometry.compactFrame.size }
-        if expandedSize != expandedFrame.size { expandedSize = expandedFrame.size }
-        if compactLeftWingWidth != geometry.leftWingWidth { compactLeftWingWidth = geometry.leftWingWidth }
-        if compactRightWingWidth != geometry.rightWingWidth { compactRightWingWidth = geometry.rightWingWidth }
-
-        let newExpandedLeftWingWidth = geometry.notchFrame.minX - expandedFrame.minX
-        let newExpandedRightWingWidth = expandedFrame.maxX - geometry.notchFrame.maxX
-        if expandedLeftWingWidth != newExpandedLeftWingWidth {
-            expandedLeftWingWidth = newExpandedLeftWingWidth
-        }
-        if expandedRightWingWidth != newExpandedRightWingWidth {
-            expandedRightWingWidth = newExpandedRightWingWidth
-        }
+        notchSize = geometry.notchSize
+        compactSize = geometry.compactFrame.size
+        expandedSize = expandedFrame.size
+        compactLeftWingWidth = geometry.leftWingWidth
+        compactRightWingWidth = geometry.rightWingWidth
+        expandedLeftWingWidth = geometry.notchFrame.minX - expandedFrame.minX
+        expandedRightWingWidth = expandedFrame.maxX - geometry.notchFrame.maxX
     }
 
     func pointerEntered() {
-        cancelPendingCollapse()
-        setExpanded(true)
+        collapseTask?.cancel()
+        expanded = true
     }
 
     func pointerExited() {
-        cancelPendingCollapse()
-        guard expanded else { return }
+        collapseTask?.cancel()
         collapseTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: Self.collapseDelay)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            self?.collapseTask = nil
-            self?.setExpanded(false)
+            do { try await Task.sleep(for: .milliseconds(200)) }
+            catch { return }
+            self?.expanded = false
         }
     }
 
-    func toggleExpansion() {
-        cancelPendingCollapse()
-        setExpanded(!expanded)
+    func toggle() {
+        collapseTask?.cancel()
+        expanded.toggle()
     }
 
     func collapse() {
-        cancelPendingCollapse()
-        setExpanded(false)
-    }
-
-    private func cancelPendingCollapse() {
         collapseTask?.cancel()
-        collapseTask = nil
-    }
-
-    private func setExpanded(_ expanded: Bool) {
-        guard self.expanded != expanded else { return }
-        self.expanded = expanded
+        expanded = false
     }
 }
 
 struct NotchIslandView: View {
-    @ObservedObject var repository: SessionRepository
-    @ObservedObject var presentation: IslandPresentation
-    let focusSession: (SessionRecord) -> Bool
+    let library: SessionLibrary
+    let presentation: IslandPresentation
+    let focusSession: (Session) -> Bool
     let openManager: () -> Void
-    let quitApplication: () -> Void
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            islandContent
-                .frame(
-                    width: presentation.islandSize.width,
-                    height: presentation.islandSize.height,
-                    alignment: .top
-                )
-                .foregroundStyle(.white)
-                .background(Color.black, in: AttachedNotchShape())
-                .clipShape(AttachedNotchShape())
-                .contentShape(AttachedNotchShape())
-                .offset(x: presentation.islandOriginX)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(.snappy(duration: 0.22), value: presentation.expanded)
-    }
-
-    private var islandContent: some View {
         VStack(alignment: .leading, spacing: 0) {
             notchBar
             if presentation.expanded {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 9) {
                     HStack {
-                        Button {
-                            quitApplication()
-                        } label: {
-                            Image(systemName: "power")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Quit Wildlife")
-                        .accessibilityLabel("Quit Wildlife")
                         Label("Wildlife", systemImage: "pawprint.fill").font(.headline)
                         Spacer()
-                        Button {
+                        Button("Open", systemImage: "rectangle.3.group") {
                             presentation.collapse()
                             openManager()
-                        } label: {
-                            Label("Open Wildlife", systemImage: "rectangle.3.group")
-                                .font(.caption)
                         }
                         .buttonStyle(.plain)
-                        .help("Open the Wildlife lane view")
-                        Button {
-                            presentation.collapse()
-                        } label: {
-                            Image(systemName: "chevron.up").foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Collapse")
                     }
-                    ForEach(repository.activeSessions.prefix(8), id: \.stableKey) { session in
+                    ForEach(library.activeSessions.prefix(8)) { session in
                         Button {
-                            if focusSession(session) {
-                                presentation.collapse()
-                            }
+                            if focusSession(session) { presentation.collapse() }
                         } label: {
                             HStack {
-                                Text(session.emoji).font(.title3)
+                                Text(session.emoji.value).font(.title3)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(session.displayTitle).font(.callout.bold()).lineLimit(1)
-                                    Text(session.runtimeStatus.displayName).font(.caption).foregroundStyle(.gray)
+                                    Text(session.activeStatus?.displayName ?? "Ended").font(.caption).foregroundStyle(.gray)
                                 }
                                 Spacer()
-                                Circle().fill(session.runtimeStatus.attentionColor).frame(width: 8, height: 8)
+                                StatusIndicator(status: session.activeStatus)
                             }
                         }
                         .buttonStyle(.plain)
                     }
-                    if repository.activeSessions.isEmpty {
-                        HStack(spacing: 9) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.title3)
-                                .foregroundStyle(.green)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text("Wildlife is running")
-                                    .font(.callout.bold())
-                                Text("No active sessions")
-                                    .font(.caption)
-                                    .foregroundStyle(.gray)
-                            }
-                            Spacer()
-                        }
-                        .accessibilityElement(children: .combine)
+                    if library.activeSessions.isEmpty {
+                        Label("No active sessions", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                     }
-                    if repository.activeSessions.count > 8 {
-                        Text("\(repository.activeSessions.count - 8) more in Wildlife")
-                            .font(.caption).foregroundStyle(.gray)
+                    if library.activeSessions.count > 8 {
+                        Text("\(library.activeSessions.count - 8) more in Wildlife").font(.caption).foregroundStyle(.gray)
                     }
                 }
-                .padding(.top, 10)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 14)
-                .transition(.opacity)
+                .padding(14)
             }
         }
+        .frame(width: presentation.islandSize.width, height: presentation.islandSize.height, alignment: .top)
+        .foregroundStyle(.white)
+        .background(Color.black, in: AttachedNotchShape())
+        .clipShape(AttachedNotchShape())
+        .animation(.snappy(duration: 0.22), value: presentation.expanded)
     }
 
-    @ViewBuilder
     private var notchBar: some View {
         HStack(spacing: 0) {
             Group {
-                if let session = repository.activeSessions.first {
-                    Text(session.emoji)
-                        .font(.system(size: 18))
-                        .accessibilityLabel(session.displayTitle)
-                } else {
-                    Image(systemName: "pawprint.fill")
-                        .font(.system(size: 15, weight: .semibold))
-                        .accessibilityLabel("Wildlife")
-                }
+                if let session = library.activeSessions.first { Text(session.emoji.value).font(.system(size: 18)) }
+                else { Image(systemName: "pawprint.fill").font(.system(size: 15, weight: .semibold)) }
             }
             .padding(.trailing, 7)
-            .frame(
-                minWidth: presentation.leftWingWidth,
-                maxWidth: presentation.leftWingWidth,
-                maxHeight: .infinity,
-                alignment: .trailing
-            )
-
-            Color.clear
-                .frame(width: presentation.notchSize.width)
-                .accessibilityHidden(true)
-
+            .frame(width: presentation.leftWingWidth, alignment: .trailing)
+            Color.clear.frame(width: presentation.notchSize.width)
             Group {
-                if let session = repository.activeSessions.first, repository.activeSessions.count > 1 {
-                    ZStack {
-                        Circle()
-                            .fill(session.runtimeStatus.attentionColor)
-                            .frame(width: 18, height: 18)
-                        Text(repository.activeSessions.count > 9 ? "9+" : "\(repository.activeSessions.count)")
-                            .font(.system(size: 8, weight: .heavy, design: .rounded))
-                            .foregroundStyle(.black.opacity(0.75))
-                    }
-                    .shadow(color: session.runtimeStatus.attentionColor.opacity(0.55), radius: 3)
-                } else if let session = repository.activeSessions.first {
-                    StatusDot(status: session.runtimeStatus)
+                if library.activeSessions.count > 1 {
+                    Text(library.activeSessions.count > 9 ? "9+" : "\(library.activeSessions.count)")
+                        .font(.caption2.bold())
                 } else {
-                    Circle()
-                        .fill(.green)
-                        .frame(width: 8, height: 8)
-                        .shadow(color: Color.green.opacity(0.55), radius: 3)
-                        .accessibilityLabel("Wildlife is running")
+                    StatusIndicator(status: library.activeSessions.first?.activeStatus)
                 }
             }
             .padding(.leading, 7)
-            .frame(
-                minWidth: presentation.rightWingWidth,
-                maxWidth: presentation.rightWingWidth,
-                maxHeight: .infinity,
-                alignment: .leading
-            )
+            .frame(width: presentation.rightWingWidth, alignment: .leading)
         }
         .frame(height: presentation.notchSize.height)
         .contentShape(Rectangle())
-        .onTapGesture { presentation.toggleExpansion() }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(compactAccessibilityLabel)
-    }
-
-    private var compactAccessibilityLabel: String {
-        guard let session = repository.activeSessions.first else {
-            return "Wildlife is running. No active sessions"
-        }
-        let additional = repository.activeSessions.count - 1
-        return additional > 0
-            ? "\(session.displayTitle), \(session.runtimeStatus.displayName), and \(additional) more sessions"
-            : "\(session.displayTitle), \(session.runtimeStatus.displayName)"
+        .onTapGesture { presentation.toggle() }
     }
 }
 
 private struct AttachedNotchShape: Shape {
     func path(in rect: CGRect) -> Path {
-        let topRadius = min(6, rect.height / 2, rect.width / 2)
-        let bottomRadius = min(14, rect.height / 2, rect.width / 2)
-        var path = Path()
-        path.move(to: CGPoint(x: rect.minX + topRadius, y: rect.minY))
-        path.addLine(to: CGPoint(x: rect.maxX - topRadius, y: rect.minY))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.maxX, y: rect.minY + topRadius),
-            control: CGPoint(x: rect.maxX, y: rect.minY)
-        )
-        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - bottomRadius))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.maxX - bottomRadius, y: rect.maxY),
-            control: CGPoint(x: rect.maxX, y: rect.maxY)
-        )
-        path.addLine(to: CGPoint(x: rect.minX + bottomRadius, y: rect.maxY))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.minX, y: rect.maxY - bottomRadius),
-            control: CGPoint(x: rect.minX, y: rect.maxY)
-        )
-        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + topRadius))
-        path.addQuadCurve(
-            to: CGPoint(x: rect.minX + topRadius, y: rect.minY),
-            control: CGPoint(x: rect.minX, y: rect.minY)
-        )
-        path.closeSubpath()
-        return path
+        RoundedRectangle(cornerRadius: 14, style: .continuous).path(in: rect)
+    }
+}
+
+struct StatusIndicator: View {
+    let status: ActiveStatus?
+
+    var body: some View {
+        Circle()
+            .fill(status?.color ?? .secondary)
+            .frame(width: 8, height: 8)
+            .shadow(color: (status?.color ?? .clear).opacity(0.6), radius: (status?.priority ?? 3) <= 1 ? 4 : 0)
+            .accessibilityLabel(status?.displayName ?? "Ended")
+    }
+}
+
+extension ActiveStatus {
+    var color: Color {
+        switch self {
+        case .waitingForApproval, .error: .orange
+        case .processing, .runningTool, .compacting, .starting: .green
+        case .waitingForInput: .blue
+        }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import WildlifeDomain
 
 private struct HookEventMetadata: Decodable {
     let sessionID: String
@@ -22,33 +23,30 @@ private struct HookEventMetadata: Decodable {
     }
 }
 
-package enum BridgeEventFactory {
+package enum AgentEventFactory {
     package static func decodeHookInput(
         _ data: Data,
         provider: AgentProvider,
         fallbackCWD: String,
         process: AgentProcessIdentity?
-    ) throws -> BridgeEvent {
+    ) throws -> AgentEvent {
         let metadata = try JSONDecoder().decode(HookEventMetadata.self, from: data)
-        let event = BridgeEvent(
-            provider: provider,
-            sessionID: metadata.sessionID,
-            lifecycleEvent: metadata.hookEventName,
+        guard let kind = AgentEvent.Kind(rawValue: metadata.hookEventName) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported hook event"))
+        }
+        let event = AgentEvent(
+            sessionID: SessionID(provider: provider, externalID: metadata.sessionID),
+            kind: kind,
             cwd: nonempty(metadata.cwd) ?? fallbackCWD,
-            processID: process?.pid,
-            processStartIdentity: process?.startIdentity,
-            tty: process?.tty,
+            process: process,
             model: nonempty(metadata.model),
             toolName: nonempty(metadata.toolName),
             startSource: nonempty(metadata.source),
             endReason: nonempty(metadata.reason),
             notificationType: nonempty(metadata.notificationType)
         )
-        guard event.isValidForTransport else {
-            throw DecodingError.dataCorrupted(.init(
-                codingPath: [],
-                debugDescription: "Hook metadata failed transport validation"
-            ))
+        guard event.isValid else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Hook metadata failed validation"))
         }
         return event
     }

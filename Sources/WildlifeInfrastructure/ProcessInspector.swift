@@ -1,18 +1,6 @@
 import Darwin
 import Foundation
-
-public struct AgentProcessIdentity: Sendable, Equatable {
-    public let pid: Int32
-    public let startIdentity: String
-    public let tty: String?
-}
-
-package enum ProcessLiveness: Sendable, Equatable {
-    case matching
-    case notRunning
-    case identityMismatch
-    case unknown
-}
+import WildlifeDomain
 
 package enum ProcessTerminationResult: Sendable, Equatable {
     case signaled
@@ -24,7 +12,7 @@ package enum ProcessTerminationResult: Sendable, Equatable {
     case failed(Int32)
 }
 
-public enum ProcessInspector {
+package enum ProcessInspector {
     private struct Row {
         let pid: Int32
         let parentPID: Int32
@@ -33,18 +21,16 @@ public enum ProcessInspector {
         let command: String
     }
 
-    public static func captureAgentProcess(
+    package static func captureAgentProcess(
         provider: AgentProvider,
         startingAt pid: Int32 = getppid()
     ) -> AgentProcessIdentity? {
         let rows = snapshot()
         let byPID = Dictionary(uniqueKeysWithValues: rows.map { ($0.pid, $0) })
         var cursor = pid
-        var fallback: Row?
 
         for _ in 0..<12 {
             guard let row = byPID[cursor] else { break }
-            fallback = fallback ?? row
             if matches(row.command, provider: provider) {
                 return AgentProcessIdentity(
                     pid: row.pid,
@@ -55,16 +41,10 @@ public enum ProcessInspector {
             if row.parentPID <= 1 || row.parentPID == cursor { break }
             cursor = row.parentPID
         }
-
-        guard let row = fallback else { return nil }
-        return AgentProcessIdentity(
-            pid: row.pid,
-            startIdentity: row.startIdentity,
-            tty: normalizedTTY(row.tty)
-        )
+        return nil
     }
 
-    public static func isAlive(pid: Int32, startIdentity: String?) -> Bool {
+    package static func isAlive(pid: Int32, startIdentity: String?) -> Bool {
         switch liveness(pid: pid, startIdentity: startIdentity) {
         case .matching, .unknown:
             return true
@@ -91,6 +71,10 @@ public enum ProcessInspector {
         guard let rows = snapshotResult(),
               let row = rows.first(where: { $0.pid == pid }) else { return .unknown }
         return row.startIdentity == startIdentity ? .matching : .identityMismatch
+    }
+
+    package static func liveness(_ process: AgentProcessIdentity) -> ProcessLiveness {
+        liveness(pid: process.pid, startIdentity: process.startIdentity)
     }
 
     package static func requestTermination(
@@ -124,7 +108,7 @@ public enum ProcessInspector {
 
     /// Returns the process and its ancestors, stopping before launchd. The app
     /// uses this to find the GUI application that owns an active terminal.
-    public static func ancestorProcessIDs(startingAt pid: Int32, limit: Int = 32) -> [Int32] {
+    package static func ancestorProcessIDs(startingAt pid: Int32, limit: Int = 32) -> [Int32] {
         guard pid > 1, limit > 0 else { return [] }
         let byPID = Dictionary(uniqueKeysWithValues: snapshot().map { ($0.pid, $0) })
         var result: [Int32] = []
@@ -180,9 +164,9 @@ public enum ProcessInspector {
         guard !value.contains("wildlife-hook") else { return false }
         switch provider {
         case .codex:
-            return value.contains("/codex ") || value.hasSuffix("/codex") || value.hasPrefix("codex ")
+            return value == "codex" || value.contains("/codex ") || value.hasSuffix("/codex") || value.hasPrefix("codex ")
         case .claude:
-            return value.contains("/claude ") || value.hasSuffix("/claude") || value.hasPrefix("claude ") || value.contains("/.local/share/claude/")
+            return value == "claude" || value.contains("/claude ") || value.hasSuffix("/claude") || value.hasPrefix("claude ") || value.contains("/.local/share/claude/")
         }
     }
 

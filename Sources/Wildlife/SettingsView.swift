@@ -1,140 +1,68 @@
 import ServiceManagement
 import SwiftUI
-import WildlifeCore
+import WildlifeDomain
+import WildlifeInfrastructure
 
 struct WildlifeSettingsView: View {
-    @ObservedObject var settings: AppSettings
-    @ObservedObject var integrations: IntegrationManager
-    @ObservedObject var runtime: AppRuntime
+    @Bindable var preferences: PreferencesStore
+    @Bindable var integrations: IntegrationManager
+    @Bindable var coordinator: AppCoordinator
+
+    var body: some View {
+        TabView {
+            GeneralSettings(preferences: preferences, coordinator: coordinator)
+                .tabItem { Label("General", systemImage: "gear") }
+            IntegrationSettings(preferences: preferences, integrations: integrations)
+                .tabItem { Label("Integrations", systemImage: "link") }
+            NotificationSettings(preferences: preferences, coordinator: coordinator)
+                .tabItem { Label("Notifications", systemImage: "bell") }
+            PrivacySettings()
+                .tabItem { Label("Privacy", systemImage: "lock.shield") }
+        }
+        .padding(20)
+        .frame(width: 660, height: 520)
+    }
+}
+
+private struct GeneralSettings: View {
+    @Bindable var preferences: PreferencesStore
+    let coordinator: AppCoordinator
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var launchError: String?
-    @State private var importMessage: String?
 
     var body: some View {
         Form {
-            Section("Agent integrations") {
-                integrationRow("Codex", state: integrations.codexState)
-                integrationRow("Claude", state: integrations.claudeState)
-                HStack {
-                    Button("Install or Repair") { integrations.installAll() }
-                    Button("Remove Hooks", role: .destructive) { integrations.uninstallAll() }
-                }
-                if let message = integrations.lastMessage { Text(message).font(.caption).foregroundStyle(.secondary) }
-                if let error = integrations.lastError { Text(error).font(.caption).foregroundStyle(.red) }
-                Text("Codex asks you to review new hooks with /hooks. Wildlife handlers are status-only and preserve other configured hooks.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section("Local agent homes") {
-                TextField("Codex home", text: $settings.codexHome)
-                    .onSubmit { integrations.refresh() }
-                TextField("Claude home", text: $settings.claudeHome)
-                    .onSubmit { integrations.refresh() }
-            }
-
-            Section("Resume command templates") {
-                templateEditor("Codex", template: $settings.codexResumeTemplate)
-                templateEditor("Claude", template: $settings.claudeResumeTemplate)
-                Text("Available placeholders: {{session_id}} and {{cwd}}. Values are safely shell-quoted when copied.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section("Notifications") {
-                Toggle("Enable attention notifications", isOn: Binding(
-                    get: { settings.notificationsEnabled },
-                    set: { runtime.setNotificationsEnabled($0) }
-                ))
-                Group {
-                    Toggle("Approvals", isOn: $settings.notificationApproval)
-                    Toggle("Waiting for input", isOn: $settings.notificationInput)
-                    Toggle("Failures", isOn: $settings.notificationFailure)
-                    Toggle("Completions", isOn: $settings.notificationCompletion)
-                }
-                .disabled(!settings.notificationsEnabled)
-                Text("Permission is requested only when notifications are enabled. Replayed and imported history stays silent.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
             Section("Organization") {
-                Toggle("Group lanes by repository", isOn: $settings.groupByProject)
-                Picker("Preferred terminal", selection: $settings.preferredTerminal) {
-                    ForEach(PreferredTerminal.allCases) { terminal in
-                        Text(terminal.displayName).tag(terminal)
-                    }
+                Toggle("Group session lists by repository", isOn: $preferences.value.groupByProject)
+                Picker("Preferred terminal", selection: $preferences.value.preferredTerminal) {
+                    ForEach(PreferredTerminal.allCases) { terminal in Text(terminal.displayName).tag(terminal) }
                 }
-                Picker("Automatically archive completed sessions", selection: $settings.autoArchiveDays) {
+                Picker("Automatically archive completed sessions", selection: $preferences.value.autoArchiveDays) {
                     Text("Never").tag(0)
                     Text("After 7 days").tag(7)
                     Text("After 30 days").tag(30)
                     Text("After 90 days").tag(90)
                 }
-                Toggle("Move failed sessions to Backlog when they end", isOn: $settings.backlogFailedSessions)
-                Toggle("Move interrupted sessions to Backlog when they end", isOn: $settings.backlogInterruptedSessions)
+                Toggle("Move failed sessions to Backlog", isOn: $preferences.value.backlogFailedSessions)
+                Toggle("Move interrupted sessions to Backlog", isOn: $preferences.value.backlogInterruptedSessions)
             }
-
             Section("Startup and history") {
                 Toggle("Launch Wildlife at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { oldValue, newValue in
-                        guard oldValue != newValue else { return }
-                        updateLaunchAtLogin(newValue)
-                    }
+                    .onChange(of: launchAtLogin) { old, new in if old != new { updateLaunchAtLogin(new) } }
                 if let launchError { Text(launchError).font(.caption).foregroundStyle(.red) }
-                Button(runtime.isImportingOlderHistory ? "Loading older sessions…" : "Load all older sessions") {
-                    runtime.importOlderHistory()
-                    importMessage = "Older local indexes are being imported."
+                Button(coordinator.isImportingHistory ? "Loading history…" : "Load all older sessions") {
+                    Task { await coordinator.importOlderHistory() }
                 }
-                .disabled(runtime.isImportingOlderHistory)
-                if let importMessage { Text(importMessage).font(.caption).foregroundStyle(.secondary) }
-            }
-
-            Section("Privacy") {
-                Text("Wildlife has no network client, telemetry, crash uploader, or updater. Hooks discard prompts and tool contents before sending metadata to the app. Removing a record never removes its agent transcript.")
-                    .font(.caption).foregroundStyle(.secondary)
+                .disabled(coordinator.isImportingHistory)
             }
         }
         .formStyle(.grouped)
-        .padding()
-        .frame(width: 640, height: 780)
-    }
-
-    @ViewBuilder
-    private func integrationRow(_ name: String, state: HookInstallationState) -> some View {
-        LabeledContent(name) {
-            switch state {
-            case .installed:
-                Label("Installed", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            case .needsRepair:
-                Label("Repair needed", systemImage: "wrench.and.screwdriver.fill")
-                    .foregroundStyle(.orange)
-            case .notInstalled:
-                Label("Not installed", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func templateEditor(_ name: String, template: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(name).font(.headline)
-            TextField("Resume template", text: template)
-                .font(.body.monospaced())
-            if let error = validationError(template.wrappedValue) {
-                Text(error).font(.caption).foregroundStyle(.red)
-            }
-        }
-    }
-
-    private func validationError(_ template: String) -> String? {
-        do { try ResumeCommandTemplate.validate(template); return nil }
-        catch { return error.localizedDescription }
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
         do {
-            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            launchAtLogin = enabled
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
             launchError = nil
         } catch {
             launchError = error.localizedDescription
@@ -143,40 +71,168 @@ struct WildlifeSettingsView: View {
     }
 }
 
+private struct IntegrationSettings: View {
+    @Bindable var preferences: PreferencesStore
+    @Bindable var integrations: IntegrationManager
+
+    var body: some View {
+        Form {
+            Section("Agent hooks") {
+                ForEach(AgentProvider.allCases) { provider in
+                    LabeledContent(provider.displayName) {
+                        Label(stateLabel(provider), systemImage: stateIcon(provider))
+                            .foregroundStyle(stateColor(provider))
+                    }
+                }
+                HStack {
+                    Button("Install or Repair") { Task { await integrations.installAll() } }
+                    Button("Remove Hooks", role: .destructive) { Task { await integrations.uninstallAll() } }
+                }
+                .disabled(integrations.isWorking)
+                if integrations.isWorking { ProgressView().controlSize(.small) }
+                if let message = integrations.message { Text(message).font(.caption).foregroundStyle(.secondary) }
+                if let error = integrations.errorMessage { Text(error).font(.caption).foregroundStyle(.red) }
+            }
+            Section("Local agent homes") {
+                TextField("Codex home", text: $preferences.value.codexHome)
+                TextField("Claude home", text: $preferences.value.claudeHome)
+                Button("Refresh Status") { Task { await integrations.refresh() } }
+            }
+            Section("Resume commands") {
+                templateEditor("Codex", text: $preferences.value.codexResumeTemplate)
+                templateEditor("Claude", text: $preferences.value.claudeResumeTemplate)
+                Text("Available placeholders: {{session_id}} and {{cwd}}. Values are shell-quoted.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .task { await integrations.refresh() }
+    }
+
+    private func state(_ provider: AgentProvider) -> HookInstallationState {
+        integrations.states[provider] ?? .notInstalled
+    }
+
+    private func stateLabel(_ provider: AgentProvider) -> String {
+        switch state(provider) {
+        case .installed: "Installed"
+        case .needsRepair: "Repair needed"
+        case .notInstalled: "Not installed"
+        }
+    }
+
+    private func stateIcon(_ provider: AgentProvider) -> String {
+        switch state(provider) {
+        case .installed: "checkmark.circle.fill"
+        case .needsRepair: "wrench.and.screwdriver.fill"
+        case .notInstalled: "exclamationmark.circle"
+        }
+    }
+
+    private func stateColor(_ provider: AgentProvider) -> Color {
+        switch state(provider) {
+        case .installed: .green
+        case .needsRepair: .orange
+        case .notInstalled: .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func templateEditor(_ name: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(name).font(.headline)
+            TextField("Resume template", text: text).font(.body.monospaced())
+            if let error = validationError(text.wrappedValue) {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func validationError(_ value: String) -> String? {
+        do { try ResumeCommandTemplate.validate(value); return nil }
+        catch { return error.localizedDescription }
+    }
+}
+
+private struct NotificationSettings: View {
+    @Bindable var preferences: PreferencesStore
+    let coordinator: AppCoordinator
+
+    var body: some View {
+        Form {
+            Section("Attention notifications") {
+                Toggle("Enable notifications", isOn: Binding(
+                    get: { preferences.value.notifications.enabled },
+                    set: { enabled in Task { await coordinator.setNotificationsEnabled(enabled) } }
+                ))
+                Group {
+                    Toggle("Approvals", isOn: $preferences.value.notifications.approvals)
+                    Toggle("Waiting for input", isOn: $preferences.value.notifications.input)
+                    Toggle("Failures", isOn: $preferences.value.notifications.failures)
+                    Toggle("Completions", isOn: $preferences.value.notifications.completions)
+                }
+                .disabled(!preferences.value.notifications.enabled)
+                Text("Imported and replayed history never produces notifications.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct PrivacySettings: View {
+    var body: some View {
+        Form {
+            Section("Local-only by design") {
+                Label("No network client, telemetry, crash uploader, or updater", systemImage: "network.slash")
+                Label("Hooks retain metadata only", systemImage: "doc.text.magnifyingglass")
+                Label("Provider sessions and transcripts are read-only", systemImage: "lock.shield")
+                Text("Removing a Wildlife record never removes its Codex or Claude session. Resume and termination actions always require confirmation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
 struct OnboardingView: View {
-    @ObservedObject var settings: AppSettings
-    @ObservedObject var integrations: IntegrationManager
+    @Bindable var preferences: PreferencesStore
+    @Bindable var integrations: IntegrationManager
     let dismiss: () -> Void
 
     var body: some View {
         VStack(spacing: 20) {
             Text("🦓").font(.system(size: 64))
             Text("Welcome to Wildlife").font(.largeTitle.bold())
-            Text("Keep every interactive Codex and Claude session visible without tying Wildlife to a particular terminal.")
+            Text("Keep interactive Codex and Claude sessions visible without tying Wildlife to a particular terminal.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 480)
             VStack(alignment: .leading, spacing: 12) {
                 Label("Local lifecycle hooks register sessions automatically", systemImage: "terminal")
-                Label("Only IDs, status, project, process, and tool names are retained", systemImage: "lock.shield")
-                Label("The most recent 30 days of local history are imported", systemImage: "clock.arrow.circlepath")
+                Label("Only lifecycle and project metadata is retained", systemImage: "lock.shield")
+                Label("Provider session data remains read-only", systemImage: "externaldrive.badge.checkmark")
             }
             .frame(maxWidth: 480, alignment: .leading)
-            if let error = integrations.lastError { Text(error).font(.caption).foregroundStyle(.red) }
+            if let error = integrations.errorMessage { Text(error).font(.caption).foregroundStyle(.red) }
             HStack {
                 Button("Not Now") {
-                    settings.onboardingCompleted = true
+                    preferences.value.onboardingCompleted = true
                     dismiss()
                 }
                 Spacer()
                 Button("Install Integrations") {
-                    integrations.installAll()
-                    if integrations.lastError == nil { dismiss() }
+                    Task {
+                        await integrations.installAll()
+                        if integrations.errorMessage == nil { dismiss() }
+                    }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(integrations.isWorking)
             }
-            Text("After installation, open /hooks once in Codex to review and trust Wildlife. Existing running sessions must be restarted or resumed.")
-                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(32)
         .frame(width: 620)

@@ -1,46 +1,51 @@
 import AppKit
-import Combine
 import CoreGraphics
+import Observation
 import SwiftUI
-import WildlifeCore
+import WildlifeDomain
+import WildlifeInfrastructure
 
 @MainActor
 final class NotchPanelController {
     private static let compactWingWidth: CGFloat = 30
     private static let expandedWidth: CGFloat = 310
 
-    private let repository: SessionRepository
-    private let focusSessionAction: (SessionRecord) -> Bool
+    private let library: SessionLibrary
+    private let focusSessionAction: (Session) -> Bool
     private let openManagerAction: () -> Void
     private let presentation = IslandPresentation()
     private var panel: NSPanel?
-    private var cancellables = Set<AnyCancellable>()
+    private var screenObserver: NSObjectProtocol?
+    private var isShutdown = false
 
     init(
-        repository: SessionRepository,
-        focusSession: @escaping (SessionRecord) -> Bool,
+        library: SessionLibrary,
+        focusSession: @escaping (Session) -> Bool,
         openManager: @escaping () -> Void
     ) {
-        self.repository = repository
+        self.library = library
         self.focusSessionAction = focusSession
         self.openManagerAction = openManager
-        repository.objectWillChange
-            .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.refreshVisibility() }
-            }
-            .store(in: &cancellables)
-        presentation.objectWillChange
-            .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.refreshVisibility() }
-            }
-            .store(in: &cancellables)
-        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
-            .sink { [weak self] _ in self?.refreshVisibility() }
-            .store(in: &cancellables)
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.refreshVisibility() } }
+        observeState()
         refreshVisibility()
     }
 
+    func shutdown() {
+        isShutdown = true
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        screenObserver = nil
+        presentation.collapse()
+        panel?.orderOut(nil)
+        panel = nil
+    }
+
     private func refreshVisibility() {
+        guard !isShutdown else { return }
         guard let screen = notchedBuiltInScreen(),
               geometry(for: screen) != nil else {
             presentation.collapse()
@@ -69,11 +74,10 @@ final class NotchPanelController {
         panel.isMovable = false
         panel.acceptsMouseMovedEvents = true
         let hostingView = NotchHostingView(rootView: NotchIslandView(
-            repository: repository,
+            library: library,
             presentation: presentation,
             focusSession: { [weak self] session in self?.focusSessionAction(session) ?? false },
-            openManager: { [weak self] in self?.openManagerAction() },
-            quitApplication: { NSApplication.shared.terminate(nil) }
+            openManager: { [weak self] in self?.openManagerAction() }
         ))
         hostingView.configure(presentation: presentation)
         hostingView.autoresizingMask = [.width, .height]
@@ -84,10 +88,10 @@ final class NotchPanelController {
     private func layoutPanel(on screen: NSScreen) {
         guard let panel,
               let geometry = geometry(for: screen) else { return }
-        let count = min(repository.activeSessions.count, 8)
+        let count = min(library.activeSessions.count, 8)
         let visibleRowCount = max(count, 1)
         let expandedHeight = geometry.notchSize.height
-            + CGFloat(58 + visibleRowCount * 43 + (repository.activeSessions.count > 8 ? 24 : 0))
+            + CGFloat(58 + visibleRowCount * 43 + (library.activeSessions.count > 8 ? 24 : 0))
         let expandedFrame = geometry.expandedFrame(width: Self.expandedWidth, height: expandedHeight)
         presentation.updateGeometry(geometry, expandedFrame: expandedFrame)
         let frame = geometry.panelFrame(
@@ -96,6 +100,19 @@ final class NotchPanelController {
             expandedHeight: expandedHeight
         )
         panel.setFrame(frame, display: true, animate: false)
+    }
+
+    private func observeState() {
+        withObservationTracking {
+            _ = library.activeSessions.count
+            _ = presentation.expanded
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard self?.isShutdown == false else { return }
+                self?.refreshVisibility()
+                self?.observeState()
+            }
+        }
     }
 
     private func notchedBuiltInScreen() -> NSScreen? {
@@ -122,14 +139,9 @@ final class NotchPanelController {
 private final class NotchHostingView<Content: View>: NSHostingView<Content> {
     private weak var presentation: IslandPresentation?
     private var islandTrackingArea: NSTrackingArea?
-    private var presentationCancellable: AnyCancellable?
 
     func configure(presentation: IslandPresentation) {
         self.presentation = presentation
-        presentationCancellable = presentation.objectWillChange
-            .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.updateTrackingAreas() }
-            }
     }
 
     override func updateTrackingAreas() {
@@ -161,8 +173,6 @@ private final class NotchHostingView<Content: View>: NSHostingView<Content> {
             width: min(presentation.islandSize.width, bounds.width),
             height: min(presentation.islandSize.height, bounds.height)
         )
-        let maximumX = max(bounds.minX, bounds.maxX - size.width)
-        let x = min(max(bounds.minX + presentation.islandOriginX, bounds.minX), maximumX)
-        return CGRect(x: x, y: bounds.maxY - size.height, width: size.width, height: size.height)
+        return CGRect(x: bounds.minX, y: bounds.maxY - size.height, width: size.width, height: size.height)
     }
 }
