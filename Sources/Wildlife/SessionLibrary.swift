@@ -87,9 +87,6 @@ final class SessionLibrary {
 
     func updateEmoji(_ value: String, sessionID: SessionID) async -> String? {
         guard EmojiAllocator.isSingleEmoji(value) else { return "Choose exactly one emoji." }
-        guard !sessions.contains(where: { $0.id != sessionID && $0.emoji.value == value }) else {
-            return "That emoji is already assigned to another session."
-        }
         await update(sessionID) { $0.emoji = .custom(value) }
         return nil
     }

@@ -162,6 +162,18 @@ struct SessionReducerTests {
         #expect(session.activitySummary.toolCount == SessionActivityRecorder.detailLimit + 2)
     }
 
+    @Test("Automatic emoji assignment avoids custom selections")
+    func automaticEmojiAvoidsCustomSelections() {
+        let existingID = SessionID(provider: .claude, externalID: "custom")
+        var existing = activeSession(id: existingID, at: 0)
+        existing.emoji = .custom(EmojiAllocator.orderedPool[0])
+        var collection = SessionCollection(sessions: [existing])
+        let newID = SessionID(provider: .codex, externalID: "automatic")
+
+        #expect(collection.consume(event(newID, .sessionStart, at: 1)) != nil)
+        #expect(collection[newID]?.emoji == .automatic(EmojiAllocator.orderedPool[1]))
+    }
+
     private func activeSession(id: SessionID, at offset: TimeInterval) -> Session {
         Session(
             id: id,

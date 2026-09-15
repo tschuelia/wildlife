@@ -1,6 +1,10 @@
-# Wildlife
+<div align="center">
+  <img src="Resources/WildlifeIcon.png" width="160" height="160" alt="Wildlife app icon">
 
-Wildlife is a local macOS companion for interactive Codex and Claude Code sessions. It keeps active work visible, organizes sessions into a practical workflow, and lets you return to the right terminal without reading or changing provider transcripts.
+  <h1>Wildlife</h1>
+
+  <p>Wildlife is a local macOS companion for interactive Codex and Claude Code sessions. It keeps active work visible, organizes sessions into a practical workflow, and lets you return to the right terminal without reading or changing provider transcripts.</p>
+</div>
 
 Wildlife v0.1.0 runs locally on macOS 15 or newer. It has no network client, telemetry, crash uploader, updater, or third-party package dependencies.
 

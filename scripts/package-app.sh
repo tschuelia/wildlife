@@ -22,6 +22,8 @@ fi
 rm -rf "$WILDLIFE_APP_DIR"
 mkdir -p "$WILDLIFE_APP_DIR/Contents/MacOS" "$WILDLIFE_APP_DIR/Contents/Resources"
 cp Resources/Info.plist "$WILDLIFE_APP_DIR/Contents/Info.plist"
+cp Resources/Assets.car "$WILDLIFE_APP_DIR/Contents/Resources/Assets.car"
+cp Resources/Wildlife.icns "$WILDLIFE_APP_DIR/Contents/Resources/Wildlife.icns"
 cp "$WILDLIFE_BIN_DIR/Wildlife" "$WILDLIFE_APP_DIR/Contents/MacOS/Wildlife"
 cp "$WILDLIFE_BIN_DIR/wildlife-hook" "$WILDLIFE_APP_DIR/Contents/Resources/wildlife-hook"
 chmod 755 "$WILDLIFE_APP_DIR/Contents/MacOS/Wildlife" "$WILDLIFE_APP_DIR/Contents/Resources/wildlife-hook"

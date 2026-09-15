@@ -8,7 +8,6 @@ struct SessionInspector: View {
     let actions: SessionActionController
     @State private var tab = InspectorTab.overview
     @State private var title = ""
-    @State private var emoji = ""
     @State private var tagDraft = ""
     @State private var notes = ""
     @State private var emojiError: String?
@@ -48,11 +47,10 @@ struct SessionInspector: View {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        TextField("Emoji", text: $emoji)
-                            .font(.system(size: 36))
-                            .textFieldStyle(.plain)
-                            .frame(width: 52)
-                            .onSubmit { applyEmoji() }
+                        NativeEmojiPickerButton(emoji: session.emoji.value) { value in
+                            Task { emojiError = await library.updateEmoji(value, sessionID: session.id) }
+                        }
+                            .frame(width: 52, height: 52)
                         TextField("Session title", text: $title)
                             .font(.title2.bold())
                             .textFieldStyle(.plain)
@@ -156,13 +154,9 @@ struct SessionInspector: View {
 
     private func synchronizeDrafts() {
         title = session.customTitle ?? session.displayTitle
-        emoji = session.emoji.value
+        emojiError = nil
         tagDraft = session.tags.joined(separator: ", ")
         notes = session.notes
-    }
-
-    private func applyEmoji() {
-        Task { emojiError = await library.updateEmoji(emoji, sessionID: session.id) }
     }
 
     private func applyTags() {

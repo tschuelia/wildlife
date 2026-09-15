@@ -20,5 +20,6 @@ let package = Package(
         .executableTarget(name: "WildlifeHook", dependencies: ["WildlifeDomain", "WildlifeInfrastructure"]),
         .testTarget(name: "WildlifeDomainTests", dependencies: ["WildlifeDomain"]),
         .testTarget(name: "WildlifeInfrastructureTests", dependencies: ["WildlifeDomain", "WildlifeInfrastructure", "CSQLite"]),
+        .testTarget(name: "WildlifeTests", dependencies: ["Wildlife", "WildlifeDomain", "WildlifeInfrastructure"]),
     ]
 )

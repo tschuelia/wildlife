@@ -8,6 +8,10 @@
     <string>Wildlife</string>
     <key>CFBundleExecutable</key>
     <string>Wildlife</string>
+    <key>CFBundleIconFile</key>
+    <string>Wildlife.icns</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>app.wildlife.sessionmanager</string>
     <key>CFBundleInfoDictionaryVersion</key>
